@@ -3,9 +3,7 @@ use std::collections::{HashMap, HashSet};
 use log::*;
 use tokio::sync::oneshot::Sender;
 
-use crate::common::*;
-use crate::core::*;
-use crate::message::*;
+use crate::{common::*, core::*, message::*};
 
 pub type JoinRealmResult = Result<(WampId, HashMap<WampString, Arg>), WampError>;
 pub enum Request<'a> {
@@ -63,6 +61,7 @@ pub enum Request<'a> {
 }
 
 /// Handler for any join realm request. This will send a HELLO and wait for the WELCOME response
+#[allow(clippy::too_many_arguments)] // This should be turned back on
 pub async fn join_realm(
     core: &mut Core<'_>,
     uri: WampString,
@@ -106,9 +105,10 @@ pub async fn join_realm(
             ),
         );
         if let Some(extra) = authextra {
-            let a: WampDict = WampDict::from([
-                ("pubkey".to_owned(), Arg::String(String::from(extra.get("pubkey").unwrap().to_owned()))),
-            ]);
+            let a: WampDict = WampDict::from([(
+                "pubkey".to_owned(),
+                Arg::String(extra.get("pubkey").unwrap().to_owned()),
+            )]);
             details.insert("authextra".to_owned(), Arg::Dict(a));
         }
     }
@@ -208,14 +208,14 @@ pub async fn subscribe(
     core: &mut Core<'_>,
     topic: WampString,
     options: WampDict,
-    res: PendingSubResult
+    res: PendingSubResult,
 ) -> Status {
     let request = core.create_request();
     if let Err(_e) = core
         .send(&Msg::Subscribe {
             request,
             topic,
-            options
+            options,
         })
         .await
     {
@@ -298,14 +298,10 @@ pub async fn register<'a>(
     uri: WampString,
     res: PendingRegisterResult,
     func_ptr: RpcFunc<'a>,
-    options: Option<WampDict>
+    options: Option<WampDict>,
 ) -> Status {
     let request = core.create_request();
-
-    let op = match options {
-        Some(c) => c,
-        None => WampDict::new()
-    };
+    let op = options.unwrap_or_default();
 
     if let Err(e) = core
         .send(&Msg::Register {
@@ -373,27 +369,18 @@ pub async fn invoke_yield(
         },
         Err(e) => {
             let uri = match &e {
-                WampError::ApplicationError(c, _d) => {
-                    c.to_owned()
-                },
-                _ => "wamp.async.rs.rpc.failed".to_string()
+                WampError::ApplicationError(c, _d) => c.to_owned(),
+                _ => "wamp.async.rs.rpc.failed".to_string(),
             };
 
             let service_details = match &e {
-                WampError::ApplicationError(_c, d) => {
-                    Some(d.to_owned())
-                },
-                _ => None
+                WampError::ApplicationError(_c, d) => Some(d.to_owned()),
+                _ => None,
             };
 
             let (arguments, kwargs): (Vec<WampPayloadValue>, WampKwArgs) = match service_details {
-                Some(d) => {
-                    (d.get_args().unwrap(), d.get_kwargs().unwrap())
-                },
-                None =>
-                {
-                    (vec![format!("{:?}", e).into()], WampKwArgs::new())
-                }
+                Some(d) => (d.get_args().unwrap(), d.get_kwargs().unwrap()),
+                None => (vec![format!("{:?}", e).into()], WampKwArgs::new()),
             };
 
             Msg::Error {
@@ -404,7 +391,7 @@ pub async fn invoke_yield(
                 arguments: Some(arguments),
                 arguments_kw: Some(kwargs),
             }
-        },
+        }
     };
     if core.send(&msg).await.is_err() {
         return Status::Shutdown;

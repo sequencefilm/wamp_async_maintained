@@ -1,11 +1,6 @@
 use crate::{
-    WampDict,
-    Arg
-};
-use crate::options::option::{
-    OptionBuilder,
-    WampOption,
-    MatchOption,
+    options::option::{MatchOption, OptionBuilder, WampOption},
+    Arg, WampDict,
 };
 
 /// Base struct for storing WampDict value
@@ -19,14 +14,20 @@ impl SubscriptionOptionItem {
     }
 
     pub fn with_match(&self, match_option: MatchOption) -> Self {
-        self.with_option(WampOption::SubscribeOption("match".to_owned(), Arg::String(match_option.value())))
+        self.with_option(WampOption::SubscribeOption(
+            "match".to_owned(),
+            Arg::String(match_option.value()),
+        ))
     }
 }
 
 /// Add base OptionBuilder functionality
 impl OptionBuilder for SubscriptionOptionItem {
     /// Build a new SubscriptionOptionItem from a provided Option<WampDict>
-    fn create(options: Option<WampDict>) -> Self where Self: OptionBuilder + Sized {
+    fn create(options: Option<WampDict>) -> Self
+    where
+        Self: OptionBuilder + Sized,
+    {
         Self(options)
     }
 

@@ -1,9 +1,7 @@
-mod subscription;
-mod registration;
 mod option;
+mod registration;
+mod subscription;
 
-pub use option::OptionBuilder;
-pub use option::InvokeOption;
-pub use option::MatchOption;
-pub use subscription::SubscribeOptions;
+pub use option::{InvokeOption, MatchOption, OptionBuilder};
 pub use registration::RegistrationOptions;
+pub use subscription::SubscribeOptions;

@@ -1,14 +1,17 @@
-use log::*;
-
 use async_trait::async_trait;
+use log::*;
 use native_tls::TlsConnector;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    net::TcpStream,
+};
 use tokio_native_tls;
 
-use crate::serializer::SerializerType;
-use crate::transport::{Transport, TransportError};
-use crate::ClientConfig;
+use crate::{
+    ClientConfig,
+    serializer::SerializerType,
+    transport::{Transport, TransportError},
+};
 
 pub const MAX_MSG_SZ: u32 = 1 << 24;
 pub const MIN_MSG_SZ: u32 = 1 << 9;
@@ -89,15 +92,7 @@ impl HandshakeCtx {
     /// Sets the maximum message size to the next or equal power of two of msg_size
     pub fn set_msg_size(&mut self, msg_size: u32) {
         let req_size: u32 = match msg_size.checked_next_power_of_two() {
-            Some(p) => {
-                if p < MIN_MSG_SZ {
-                    MIN_MSG_SZ
-                } else if p > MAX_MSG_SZ {
-                    MAX_MSG_SZ
-                } else {
-                    p
-                }
-            }
+            Some(p) => p.clamp(MIN_MSG_SZ, MAX_MSG_SZ),
             None => MAX_MSG_SZ,
         };
 
@@ -132,7 +127,7 @@ impl HandshakeCtx {
                 return Err(TransportError::UnexpectedResponse);
             }
 
-            let server_error: u8 = (self.server[1] & 0xF0) >> 4 as u8;
+            let server_error: u8 = (self.server[1] & 0xF0) >> 4;
             return Err(match server_error {
                 1 => TransportError::SerializerNotSupported(self.serializer.to_str().to_string()),
                 2 => TransportError::InvalidMaximumMsgSize(self.msg_size),
@@ -208,10 +203,11 @@ enum SockWrapper {
 impl SockWrapper {
     pub fn close(&mut self) {
         let sock = match self {
-            SockWrapper::Plain(ref mut s) => s,
+            SockWrapper::Plain(s) => s,
             SockWrapper::Tls(s) => s.get_mut().get_mut().get_mut(),
         };
 
+        #[allow(clippy::match_single_binding)]
         match sock.shutdown() {
             _ => {}
         };
@@ -221,7 +217,7 @@ impl SockWrapper {
 impl SockWrapper {
     pub async fn write_all(&mut self, bytes: &[u8]) -> Result<(), TransportError> {
         let res = match self {
-            SockWrapper::Plain(ref mut s) => s.write_all(bytes).await,
+            SockWrapper::Plain(s) => s.write_all(bytes).await,
             SockWrapper::Tls(s) => s.write_all(bytes).await,
         };
 
@@ -235,7 +231,7 @@ impl SockWrapper {
 
     pub async fn read_exact(&mut self, out_bytes: &mut [u8]) -> Result<(), TransportError> {
         let res = match self {
-            SockWrapper::Plain(ref mut s) => s.read_exact(out_bytes).await,
+            SockWrapper::Plain(s) => s.read_exact(out_bytes).await,
             SockWrapper::Tls(s) => s.read_exact(out_bytes).await,
         };
 
@@ -298,7 +294,6 @@ impl Transport for TcpTransport {
             };
 
             payload = Vec::with_capacity(header.payload_len() as usize);
-            unsafe { payload.set_len(header.payload_len() as usize) };
             self.sock.read_exact(&mut payload).await?;
             trace!("Recv[0x{:X}] : {:?}", payload.len(), payload);
 

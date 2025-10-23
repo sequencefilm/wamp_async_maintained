@@ -1,5 +1,7 @@
-use std::error::Error;
-use std::sync::{Arc, RwLock};
+use std::{
+    error::Error,
+    sync::{Arc, RwLock},
+};
 
 use wamp_async::{Client, ClientConfig, SerializerType, WampArgs, WampKwArgs};
 

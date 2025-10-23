@@ -13,9 +13,7 @@ pub async fn subscribed(core: &mut Core<'_>, request: WampId, sub_id: WampId) ->
     };
     let (evt_queue_w, evt_queue_r) = mpsc::unbounded_channel();
 
-    if !core.subscriptions.contains_key(&sub_id) {
-        core.subscriptions.insert(sub_id, vec![]);
-    }
+    core.subscriptions.entry(sub_id).or_default();
 
     // Add the subscription ID to our subscription map
     let mut subs = core.subscriptions.get(&sub_id).unwrap().to_owned();
@@ -79,9 +77,14 @@ pub async fn event(
     };
 
     // Forward the event to the client
-    evt_queues.into_iter().for_each(|evt_queue| {
+    evt_queues.iter().for_each(|evt_queue| {
         if evt_queue
-            .send((publication, details.clone(), arguments.clone(), arguments_kw.clone()))
+            .send((
+                publication,
+                details.clone(),
+                arguments.clone(),
+                arguments_kw.clone(),
+            ))
             .is_err()
         {
             warn!(
@@ -90,7 +93,6 @@ pub async fn event(
             );
             // TODO : Should we be nice and send an UNSUBSCRIBE to the server ?
         }
-
     });
 
     Status::Ok

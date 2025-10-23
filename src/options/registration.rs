@@ -1,13 +1,5 @@
-use crate::{
-    WampDict,
-    Arg
-};
-pub use crate::options::option::{
-    OptionBuilder,
-    WampOption,
-    MatchOption,
-    InvokeOption,
-};
+pub use crate::options::option::{InvokeOption, MatchOption, OptionBuilder, WampOption};
+use crate::{Arg, WampDict};
 
 /// Base struct for storing WampDict value
 pub struct RegistrationOptionItem(Option<WampDict>);
@@ -21,7 +13,10 @@ impl RegistrationOptionItem {
 
     /// Add an option for how the router should invoke the endpoint
     pub fn with_invoke(&self, invoke_option: InvokeOption) -> Self {
-        self.with_option(WampOption::RegisterOption("invoke".to_owned(), Arg::String(invoke_option.value())))
+        self.with_option(WampOption::RegisterOption(
+            "invoke".to_owned(),
+            Arg::String(invoke_option.value()),
+        ))
     }
 
     /// Add an option for how the router should match the rpc.
@@ -31,14 +26,20 @@ impl RegistrationOptionItem {
 
     /// Add an option for how the router should match the rpc.
     pub fn with_match(&self, match_option: MatchOption) -> Self {
-        self.with_option(WampOption::RegisterOption("match".to_owned(), Arg::String(match_option.value())))
+        self.with_option(WampOption::RegisterOption(
+            "match".to_owned(),
+            Arg::String(match_option.value()),
+        ))
     }
 }
 
 /// Add base OptionBuilder functionality
 impl OptionBuilder for RegistrationOptionItem {
     /// Build a new RegistrationOptionItem from a provided Option<WampDict>
-    fn create(options: Option<WampDict>) -> Self where Self: OptionBuilder + Sized {
+    fn create(options: Option<WampDict>) -> Self
+    where
+        Self: OptionBuilder + Sized,
+    {
         Self(options)
     }
 

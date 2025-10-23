@@ -1,6 +1,6 @@
-use crate::message::*;
-use crate::serializer::*;
 use rmp_serde::{from_slice, to_vec};
+
+use crate::{message::*, serializer::*};
 
 pub struct MsgPackSerializer {}
 impl SerializerImpl for MsgPackSerializer {
@@ -10,7 +10,7 @@ impl SerializerImpl for MsgPackSerializer {
             Err(e) => Err(SerializerError::Serialization(e.to_string())),
         }
     }
-    fn unpack<'a>(&self, v: &'a [u8]) -> Result<Msg, SerializerError> {
+    fn unpack(&self, v: &[u8]) -> Result<Msg, SerializerError> {
         match from_slice(v) {
             Ok(v) => Ok(v),
             Err(e) => Err(SerializerError::Deserialization(e.to_string())),

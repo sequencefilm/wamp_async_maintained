@@ -1,10 +1,12 @@
-use std::error::Error;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::{
+    error::Error,
+    sync::atomic::{AtomicU64, Ordering},
+};
 
 use lazy_static::*;
-
 use wamp_async::{
-    Client, ClientConfig, ClientState, SerializerType, WampArgs, WampError, WampKwArgs, RegistrationOptions, InvokeOption
+    Client, ClientConfig, ClientState, InvokeOption, RegistrationOptions, SerializerType, WampArgs,
+    WampError, WampKwArgs,
 };
 
 lazy_static! {
@@ -52,13 +54,15 @@ async fn strict_echo(
     ))
 }
 
+const ROUTER_URL: &str = "ws://localhost:8000/ws";
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
     env_logger::init();
 
     // Connect to the server
     let (mut client, (evt_loop, rpc_evt_queue)) = Client::connect(
-        "wss://localhost:8080/ws",
+        ROUTER_URL,
         Some(
             ClientConfig::default()
                 // Allow invalid/self signed certs
@@ -94,7 +98,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
     // Register our functions to a uri
     let echo_options = RegistrationOptions::invoke(InvokeOption::Last);
 
-    let echo_rpc_id = client.register_with_options("peer.echo", echo, echo_options).await?;
+    let echo_rpc_id = client
+        .register_with_options("peer.echo", echo, echo_options)
+        .await?;
     let strict_echo_rpc_id = client.register("peer.strict_echo", strict_echo).await?;
 
     println!("Waiting for 'peer.echo' to be called at least 4 times");

@@ -1,5 +1,6 @@
 use std::error::Error;
-use wamp_async::{Client, ClientConfig, SubscribeOptions, Arg, MatchOption};
+
+use wamp_async::{Arg, Client, ClientConfig, MatchOption, SubscribeOptions};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
@@ -25,7 +26,15 @@ async fn main() -> Result<(), Box<dyn Error>> {
     // If one of the args is "pub", start as a publisher
     if let Some(_) = std::env::args().find(|a| a == "pub") {
         loop {
-            match client.publish(format!("peer.heartbeat.{}", cur_event_num), None, None, true).await {
+            match client
+                .publish(
+                    format!("peer.heartbeat.{}", cur_event_num),
+                    None,
+                    None,
+                    true,
+                )
+                .await
+            {
                 Ok(pub_id) => println!("\tSent event id {}", pub_id.unwrap()),
                 Err(e) => {
                     println!("publish error {}", e);
@@ -45,9 +54,16 @@ async fn main() -> Result<(), Box<dyn Error>> {
             "Subscribing to peer.heartbeat events. Start another instance with a 'pub' argument"
         );
         // Prefix Match
-        let (sub_id, mut heartbeat_queue) = client.subscribe_with_options("peer.heartbeat", SubscribeOptions::match_(MatchOption::Prefix)).await?;
+        let (sub_id, mut heartbeat_queue) = client
+            .subscribe_with_options(
+                "peer.heartbeat",
+                SubscribeOptions::match_(MatchOption::Prefix),
+            )
+            .await?;
         // Wildcard match with empty uri part
-        let (last_sub_id, mut heartbeat_last) = client.subscribe_with_options("peer..9", SubscribeOptions::match_(MatchOption::Wildcard)).await?;
+        let (last_sub_id, mut heartbeat_last) = client
+            .subscribe_with_options("peer..9", SubscribeOptions::match_(MatchOption::Wildcard))
+            .await?;
         println!("Waiting for {} heartbeats...", max_events);
 
         while cur_event_num < max_events {

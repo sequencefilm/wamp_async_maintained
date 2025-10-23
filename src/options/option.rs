@@ -1,16 +1,11 @@
-use crate::{
-    Arg,
-    WampDict,
-    WampString,
-};
+use crate::{Arg, WampDict, WampString};
 
 pub enum InvokeOption {
     Single,
     First,
     Last,
     Roundrobin,
-    Random
-
+    Random,
 }
 
 impl InvokeOption {
@@ -53,24 +48,26 @@ pub enum WampOption<K, V> {
     /// A Callee role feature option
     RegisterOption(K, V),
     /// An empty option
-    None
+    None,
 }
 
 /// Provides generic functionality for role options dictionary generation
 pub trait OptionBuilder {
-
     /// Clones or creates a WampDict and inserts the key/value pair from the supplied WampOption
     ///
     /// * `option` - The key/value pair to insert into the dictionary
-    fn with_option(&self, option: WampOption<String, Arg>) -> Self where Self: OptionBuilder + Sized {
+    fn with_option(&self, option: WampOption<String, Arg>) -> Self
+    where
+        Self: OptionBuilder + Sized,
+    {
         let mut next_options = match &self.get_dict() {
             Some(opts) => opts.clone(),
-            None => WampDict::new()
+            None => WampDict::new(),
         };
 
         let (key, value) = match Self::validate_option(option.clone()) {
             Some(result) => result,
-            None => panic!("Can't create invalid option {:?}", option)
+            None => panic!("Can't create invalid option {:?}", option),
         };
 
         next_options.insert(key, value);
@@ -94,20 +91,27 @@ pub trait OptionBuilder {
     }
 
     /// Create a new empty builder - provided for convention
-    fn new() -> Self where Self: OptionBuilder + Sized {
+    fn new() -> Self
+    where
+        Self: OptionBuilder + Sized,
+    {
         Self::empty()
     }
 
     /// Create a new empty builder
-    fn empty() -> Self where Self: OptionBuilder + Sized {
+    fn empty() -> Self
+    where
+        Self: OptionBuilder + Sized,
+    {
         Self::create(None)
     }
 
     /// Create an OptionBuilder using the provided WampDict
     /// Must implement
-    fn create(options: Option<WampDict>) -> Self where Self: OptionBuilder + Sized;
+    fn create(options: Option<WampDict>) -> Self
+    where
+        Self: OptionBuilder + Sized;
     /// Return the current builder WampDict
     /// Must implement
     fn get_dict(&self) -> Option<WampDict>;
-
 }

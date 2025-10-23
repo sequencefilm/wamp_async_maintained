@@ -1,8 +1,9 @@
-use std::error::Error;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::{
+    error::Error,
+    sync::atomic::{AtomicU64, Ordering},
+};
 
 use lazy_static::*;
-
 use wamp_async::{
     Client, ClientConfig, ClientState, SerializerType, WampArgs, WampError, WampKwArgs,
 };

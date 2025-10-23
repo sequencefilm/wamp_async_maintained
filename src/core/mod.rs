@@ -1,22 +1,23 @@
 use std::collections::{HashMap, HashSet};
 
 use log::*;
-use tokio::select;
-use tokio::sync::oneshot::Sender;
-use tokio::sync::{mpsc, mpsc::UnboundedReceiver, mpsc::UnboundedSender};
+use tokio::{
+    select,
+    sync::{
+        mpsc,
+        mpsc::{UnboundedReceiver, UnboundedSender},
+        oneshot::Sender,
+    },
+};
 
-use crate::common::*;
-use crate::error::*;
-use crate::serializer::*;
-use crate::transport::*;
+use crate::{common::*, error::*, serializer::*, transport::*};
 
 mod recv;
 mod send;
 
-use crate::client;
-use crate::message::*;
-use crate::Arg;
 pub use send::Request;
+
+use crate::{Arg, client, message::*};
 
 pub enum Status {
     /// Returned when the event loop should shutdown
@@ -35,7 +36,7 @@ pub type JoinResult = Sender<
 >;
 pub type SubscriptionQueue = UnboundedReceiver<(
     WampId,           // Publish event ID
-    WampDict,        // Publish event Details
+    WampDict,         // Publish event Details
     Option<WampArgs>, // Publish args
     Option<WampKwArgs>,
 )>; // publish kwargs
@@ -64,7 +65,8 @@ pub type PendingCallResult = Sender<
     >,
 >;
 
-type SubscriptionChannel = UnboundedSender<(WampId, WampDict, Option<WampArgs>, Option<WampKwArgs>)>;
+type SubscriptionChannel =
+    UnboundedSender<(WampId, WampDict, Option<WampArgs>, Option<WampKwArgs>)>;
 
 pub struct Core<'a> {
     /// Generic transport
@@ -109,7 +111,7 @@ impl<'a> Core<'a> {
     ) -> Result<Core<'a>, WampError> {
         // Connect to the router using the requested transport
         let (sock, serializer_type) = match uri.scheme() {
-            "ws" | "wss" => ws::connect(uri, &cfg).await?,
+            "ws" | "wss" => ws::connect(uri, cfg).await?,
             "tcp" | "tcps" => {
                 let host_port = match uri.port() {
                     Some(p) => p,
@@ -123,7 +125,7 @@ impl<'a> Core<'a> {
                     uri.host_str().unwrap(),
                     host_port,
                     uri.scheme() != "tcp",
-                    &cfg,
+                    cfg,
                 )
                 .await?
             }
@@ -220,11 +222,11 @@ impl<'a> Core<'a> {
         'a: 'b,
     {
         // Make sure we were expecting this message if it has a request ID
-        if let Some(ref request) = msg.request_id() {
-            if !self.pending_requests.remove(request) {
-                warn!("Peer sent a response to an unknown request : {}", request);
-                return Status::Ok;
-            }
+        if let Some(ref request) = msg.request_id()
+            && !self.pending_requests.remove(request)
+        {
+            warn!("Peer sent a response to an unknown request : {}", request);
+            return Status::Ok;
         }
         match msg {
             Msg::Subscribed {
@@ -327,7 +329,9 @@ impl<'a> Core<'a> {
                 .await
             }
             Request::Leave { res } => send::leave_realm(self, res).await,
-            Request::Subscribe { uri, options, res } => send::subscribe(self, uri, options, res).await,
+            Request::Subscribe { uri, options, res } => {
+                send::subscribe(self, uri, options, res).await
+            }
             Request::Unsubscribe { sub_id, res } => send::unsubscribe(self, sub_id, res).await,
             Request::Publish {
                 uri,
@@ -336,9 +340,12 @@ impl<'a> Core<'a> {
                 arguments_kw,
                 res,
             } => send::publish(self, uri, options, arguments, arguments_kw, res).await,
-            Request::Register { uri, res, func_ptr, options } => {
-                send::register(self, uri, res, func_ptr, Some(options)).await
-            }
+            Request::Register {
+                uri,
+                res,
+                func_ptr,
+                options,
+            } => send::register(self, uri, res, func_ptr, Some(options)).await,
             Request::Unregister { rpc_id, res } => send::unregister(self, rpc_id, res).await,
             Request::InvocationResult { request, res } => {
                 send::invoke_yield(self, request, res).await

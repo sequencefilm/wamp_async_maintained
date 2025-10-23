@@ -1,17 +1,20 @@
+use std::str::FromStr;
+
 use async_trait::async_trait;
 use futures::{SinkExt, StreamExt};
 use log::*;
-use std::str::FromStr;
 use tokio::net::TcpStream;
 use tokio_tungstenite::{
     client_async,
-    tungstenite::{handshake::client::Request, Message},
+    tungstenite::{handshake::client::Request, Bytes, Message},
     MaybeTlsStream, WebSocketStream,
 };
 
-use crate::client::ClientConfig;
-use crate::serializer::SerializerType;
-use crate::transport::{Transport, TransportError};
+use crate::{
+    client::ClientConfig,
+    serializer::SerializerType,
+    transport::{Transport, TransportError},
+};
 
 struct WsCtx {
     is_bin: bool,
@@ -20,14 +23,16 @@ struct WsCtx {
 
 #[async_trait]
 impl Transport for WsCtx {
-    async fn send(&mut self, data: &[u8]) -> Result<(), TransportError> {
-        trace!("Send[0x{:X}] : {:?}", data.len(), data);
+    async fn send(&mut self, byte_data: &[u8]) -> Result<(), TransportError> {
+        trace!("Send[0x{:X}] : {:?}", byte_data.len(), byte_data);
+        let data = Vec::from(byte_data);
+
         let res = if self.is_bin {
-            self.client.send(Message::Binary(Vec::from(data))).await
+            self.client.send(Message::Binary(Bytes::from(data))).await
         } else {
-            let str_payload = std::str::from_utf8(data).unwrap().to_owned();
+            let str_payload = std::str::from_utf8(&data).unwrap().to_owned();
             trace!("Text('{}')", str_payload);
-            self.client.send(Message::Text(str_payload)).await
+            self.client.send(Message::Text(str_payload.into())).await
         };
 
         if let Err(e) = res {
@@ -39,7 +44,7 @@ impl Transport for WsCtx {
     }
 
     async fn recv(&mut self) -> Result<Vec<u8>, TransportError> {
-        let payload;
+        let payload: Vec<u8>;
         // Receive a message
         loop {
             let msg: Message = match self.client.next().await {
@@ -66,7 +71,7 @@ impl Transport for WsCtx {
                         error!("Got websocket Binary message but only Text is allowed");
                         return Err(TransportError::UnexpectedResponse);
                     }
-                    b
+                    Vec::from(b)
                 }
                 Message::Ping(d) => {
                     if let Err(e) = self.client.send(Message::Pong(d)).await {
@@ -88,9 +93,7 @@ impl Transport for WsCtx {
     }
 
     async fn close(&mut self) {
-        match self.client.close(None) {
-            _ => { /*ignore result*/ }
-        };
+        let _ = self.client.close(None).await;
     }
 }
 
@@ -111,6 +114,14 @@ pub async fn connect(
         .collect::<Vec<&str>>()
         .join(",");
     request = request.header("Sec-WebSocket-Protocol", serializer_list);
+
+    let key = tokio_tungstenite::tungstenite::handshake::client::generate_key();
+    request = request.header("Sec-WebSocket-Key", key.clone());
+    request = request.header("Sec-WebSocket-Version", 13);
+    request = request.header("Host", "example");
+    request = request.header("Origin", "example");
+    request = request.header("Upgrade", "websocket");
+    request = request.header("Connection", "Upgrade");
 
     for (key, value) in config.get_websocket_headers() {
         request = request.header(key, value);
@@ -135,7 +146,9 @@ pub async fn connect(
         _ => panic!("ws::connect called but uri doesnt have websocket scheme"),
     };
 
-    let (client, resp) = match client_async(request.body(()).unwrap(), sock).await {
+    let request_body = request.body(()).unwrap();
+
+    let (client, resp) = match client_async(request_body, sock).await {
         Ok(v) => v,
         Err(e) => {
             error!("Websocket failed to connect : {:?}", e);
@@ -175,11 +188,10 @@ pub async fn connect(
 
     Ok((
         Box::new(WsCtx {
-            is_bin: match picked_serializer {
-                SerializerType::MsgPack => true,
-                SerializerType::Cbor=> true,
-                _ => false,
-            },
+            is_bin: matches!(
+                picked_serializer,
+                SerializerType::MsgPack | SerializerType::Cbor
+            ),
             client,
         }),
         picked_serializer,

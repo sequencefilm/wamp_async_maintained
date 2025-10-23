@@ -2,9 +2,9 @@ use quick_error::*;
 
 use crate::message::Msg;
 
+pub mod cbor;
 pub mod json;
 pub mod msgpack;
-pub mod cbor;
 
 #[repr(u8)]
 #[derive(Debug, Copy, Clone)]
@@ -62,5 +62,5 @@ quick_error! {
 
 pub trait SerializerImpl {
     fn pack(&self, value: &Msg) -> Result<Vec<u8>, SerializerError>;
-    fn unpack<'a>(&self, v: &'a [u8]) -> Result<Msg, SerializerError>;
+    fn unpack(&self, v: &[u8]) -> Result<Msg, SerializerError>;
 }

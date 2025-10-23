@@ -1,8 +1,9 @@
-use std::error::Error;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::{
+    error::Error,
+    sync::atomic::{AtomicU64, Ordering},
+};
 
 use lazy_static::*;
-
 use wamp_async::{
     Client, ClientConfig, ClientState, SerializerType, WampArgs, WampError, WampKwArgs,
 };
@@ -52,13 +53,15 @@ async fn strict_echo(
     ))
 }
 
+const ROUTER_URL: &str = "ws://localhost:8000/ws";
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
     env_logger::init();
 
     // Connect to the server
     let (mut client, (evt_loop, rpc_evt_queue)) = Client::connect(
-        "ws://localhost:8080/ws",
+        ROUTER_URL,
         Some(
             ClientConfig::default()
                 // Allow invalid/self signed certs

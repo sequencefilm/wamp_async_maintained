@@ -1,7 +1,6 @@
 use std::error::Error;
 
 use serde::{Deserialize, Serialize};
-
 use wamp_async::{
     try_into_any_value, Client, ClientConfig, ClientRole, SerializerType, WampKwArgs,
 };
@@ -11,13 +10,15 @@ struct MyStruct {
     field1: String,
 }
 
+const ROUTER_URL: &str = "ws://localhost:8000/ws";
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
     env_logger::init();
 
     // Connect to the server
     let (mut client, (evt_loop, _rpc_evt_queue)) = Client::connect(
-        "wss://localhost:8080/ws",
+        ROUTER_URL,
         Some(
             ClientConfig::default()
                 .set_ssl_verify(false)

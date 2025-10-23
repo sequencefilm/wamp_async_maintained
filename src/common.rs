@@ -1,11 +1,7 @@
-use std::collections::HashMap;
-use std::fmt;
-use std::future::Future;
-use std::hash::Hash;
-use std::num::NonZeroU64;
-use std::pin::Pin;
-use std::str::FromStr;
-use std::convert::TryInto;
+use std::{
+    collections::HashMap, convert::TryInto, fmt, future::Future, hash::Hash, num::NonZeroU64,
+    pin::Pin, str::FromStr,
+};
 
 use log::*;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
@@ -59,7 +55,7 @@ pub type WampList = Vec<Arg>;
 ///
 /// Implementation note: we currently use `serde_json::Value`, which is
 /// suboptimal when you want to use MsgPack and pass binary data.
-
+///
 pub type WampPayloadValue = serde_json::Value;
 /// Unnamed WAMP argument list
 pub type WampArgs = Vec<WampPayloadValue>;
@@ -76,17 +72,10 @@ pub struct ApplicationErrorDetails {
 
 impl ApplicationErrorDetails {
     pub fn new(args: Option<WampList>, kwargs: Option<WampDict>) -> Self {
-        let a = match args {
-            Some(d) => d,
-            None => vec![]
-        };
+        let a = args.unwrap_or_default();
+        let k = kwargs.unwrap_or_default();
 
-        let k = match kwargs {
-            Some(d) => d,
-            None => WampDict::default()
-        };
-
-        ApplicationErrorDetails { args: a, kwargs: k}
+        ApplicationErrorDetails { args: a, kwargs: k }
     }
     pub fn get_args(&self) -> Result<WampArgs, WampError> {
         try_into_args(&self.args)
@@ -96,25 +85,22 @@ impl ApplicationErrorDetails {
         try_into_kwargs(&self.kwargs)
     }
 
-    pub fn get_error_message(&self) -> () {
-    }
+    pub fn get_error_message(&self) {}
 }
 
 #[derive(Copy, Clone)]
 pub struct CryptoSign {
-    pub sk: [u8; 32]
+    pub sk: [u8; 32],
 }
 
 impl CryptoSign {
     pub fn new(secret_key: String) -> CryptoSign {
         let raw_sk = secret_key.to_owned();
         let sk = CryptoSign::vec_array32(hex::decode(raw_sk).ok().unwrap());
-        CryptoSign {
-            sk: sk,
-        }
+        CryptoSign { sk }
     }
 
-    pub fn generate_signature<'a>(&'a self, extra: HashMap<String, Arg>) -> String {
+    pub fn generate_signature(&self, extra: HashMap<String, Arg>) -> String {
         let f = nacl::sign::generate_keypair(&self.sk);
 
         let data = extra.get("challenge").unwrap();
@@ -123,13 +109,18 @@ impl CryptoSign {
             _ => panic!("ERROR"),
         };
 
-        let signature = CryptoSign::vec_array96(nacl::sign::sign(&CryptoSign::hex2bytes(challenge), &f.skey).ok().unwrap());
+        let signature = CryptoSign::vec_array96(
+            nacl::sign::sign(&CryptoSign::hex2bytes(challenge), &f.skey)
+                .ok()
+                .unwrap(),
+        );
         CryptoSign::bytes2hex96(signature)
     }
 
     pub fn vec_array32<T>(v: Vec<T>) -> [T; 32] {
-        v.try_into()
-            .unwrap_or_else(|v: Vec<T>| panic!("Expected a Vec of length {} but it was {}", 32, v.len()))
+        v.try_into().unwrap_or_else(|v: Vec<T>| {
+            panic!("Expected a Vec of length {} but it was {}", 32, v.len())
+        })
     }
     pub fn hex2bytes(s: &str) -> [u8; 32] {
         let res = hex::decode(s).ok().unwrap();
@@ -142,11 +133,12 @@ impl CryptoSign {
     }
 
     pub fn vec_array96<T>(v: Vec<T>) -> [T; 96] {
-        v.try_into()
-            .unwrap_or_else(|v: Vec<T>| panic!("Expected a Vec of length {} but it was {}", 96, v.len()))
+        v.try_into().unwrap_or_else(|v: Vec<T>| {
+            panic!("Expected a Vec of length {} but it was {}", 96, v.len())
+        })
     }
 
-    pub fn bytes2hex96(d: [u8; 96]) -> String  {
+    pub fn bytes2hex96(d: [u8; 96]) -> String {
         hex::encode(d)
     }
 }
@@ -203,21 +195,16 @@ impl ClientRole {
         match self {
             ClientRole::Subscriber => {
                 let mut features = WampDict::new();
-                for feature in vec!["pattern_based_subscription"] {
-                    features.insert(feature.to_owned(), Arg::Bool(true));
-                }
-                features.clone()
-            },
-            _ => WampDict::new()
+                features.insert("pattern_based_subscription".to_owned(), Arg::Bool(true));
+                features
+            }
+            _ => WampDict::new(),
         }
     }
 
     /// Returns true if the role has features that need to be declared
     pub fn has_features(&self) -> bool {
-        match self {
-            ClientRole::Subscriber => true,
-            _ => false
-        }
+        matches!(self, ClientRole::Subscriber)
     }
 }
 
@@ -320,13 +307,10 @@ impl AuthenticationChallengeResponse {
             extra: f,
         }
     }
-
 }
 
 /// Convert WampPayloadValue into any serde-deserializable object
-pub fn try_from_any_value<'a, T: DeserializeOwned>(
-    value: WampPayloadValue,
-) -> Result<T, WampError> {
+pub fn try_from_any_value<T: DeserializeOwned>(value: WampPayloadValue) -> Result<T, WampError> {
     serde_json::from_value(value).map_err(|e| {
         WampError::SerializationError(crate::serializer::SerializerError::Deserialization(
             e.to_string(),
@@ -335,12 +319,12 @@ pub fn try_from_any_value<'a, T: DeserializeOwned>(
 }
 
 /// Convert WampArgs into any serde-deserializable object
-pub fn try_from_args<'a, T: DeserializeOwned>(value: WampArgs) -> Result<T, WampError> {
+pub fn try_from_args<T: DeserializeOwned>(value: WampArgs) -> Result<T, WampError> {
     try_from_any_value(value.into())
 }
 
 /// Convert WampArgs into any serde-deserializable object
-pub fn try_from_kwargs<'a, T: DeserializeOwned>(value: WampKwArgs) -> Result<T, WampError> {
+pub fn try_from_kwargs<T: DeserializeOwned>(value: WampKwArgs) -> Result<T, WampError> {
     try_from_any_value(value.into())
 }
 

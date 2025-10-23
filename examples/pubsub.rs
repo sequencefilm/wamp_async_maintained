@@ -1,4 +1,5 @@
 use std::error::Error;
+
 use wamp_async::{Client, ClientConfig};
 
 #[tokio::main]
@@ -50,7 +51,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
         while cur_event_num < max_events {
             match heartbeat_queue.recv().await {
                 Some((pub_id, details, args, kwargs)) => {
-                    println!("\tGot {} (details: {:?}, args: {:?}, kwargs: {:?})", pub_id, details, args, kwargs)
+                    println!(
+                        "\tGot {} (details: {:?}, args: {:?}, kwargs: {:?})",
+                        pub_id, details, args, kwargs
+                    )
                 }
                 None => println!("Subscription is done"),
             };
