@@ -114,7 +114,7 @@ pub async fn connect(
         .join(",");
     request = request.header("Sec-WebSocket-Protocol", serializer_list);
 
-    let key = tokio_tungstenite::tungstenite::handshake::client::generate_key();
+    // let key = tokio_tungstenite::tungstenite::handshake::client::generate_key();
     // request = request.header("Sec-WebSocket-Key", key.clone());
     // request = request.header("Sec-WebSocket-Version", 13);
     // request = request.header("Host", "example");
