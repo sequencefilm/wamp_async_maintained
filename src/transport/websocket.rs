@@ -148,6 +148,10 @@ pub async fn connect(
 
     let request_body = request.body(()).unwrap();
 
+    for (key, value) in request_body.headers().iter() {
+        error!("Request Header '{}' = '{:?}'", key.as_str(), value);
+    }
+
     let (client, resp) = match client_async(request_body, sock).await {
         Ok(v) => v,
         Err(e) => {
