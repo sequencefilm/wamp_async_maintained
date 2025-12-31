@@ -122,10 +122,17 @@ pub async fn connect(
 
     for (key, value) in config.get_websocket_headers() {
         request = request.header(key, value);
+
+        error!("Custom Header '{}' = '{:?}'", key, value);
     }
 
     // Remove the Sec-WebSocket-Key header if it exists
     request.headers_mut().map(|h| h.remove("sec-websocket-key"));
+
+    error!(
+        "Number of headers: {}",
+        request.headers_ref().map(|h| h.len()).unwrap_or(0)
+    );
 
     for (key, value) in request.headers_ref().unwrap().iter() {
         error!("Request Header '{}' = '{:?}'", key.as_str(), value);
