@@ -127,6 +127,10 @@ pub async fn connect(
     // Remove the Sec-WebSocket-Key header if it exists
     request.headers_mut().map(|h| h.remove("sec-websocket-key"));
 
+    for (key, value) in request.headers_ref().unwrap().iter() {
+        error!("Request Header '{}' = '{:?}'", key.as_str(), value);
+    }
+
     let sock = match url.scheme() {
         "ws" => MaybeTlsStream::Plain(
             crate::transport::tcp::connect_raw(
