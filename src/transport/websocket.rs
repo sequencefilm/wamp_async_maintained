@@ -114,13 +114,11 @@ pub async fn connect(
         .join(",");
     request = request.header("Sec-WebSocket-Protocol", serializer_list);
 
-    // let key = tokio_tungstenite::tungstenite::handshake::client::generate_key();
-    // request = request.header("Sec-WebSocket-Key", key.clone());
-    // request = request.header("Sec-WebSocket-Version", 13);
-    // request = request.header("Host", "example");
-    // request = request.header("Origin", "example");
-    // request = request.header("Upgrade", "websocket");
-    // request = request.header("Connection", "Upgrade");
+    request = request.header("Sec-WebSocket-Version", 13);
+    request = request.header("Host", "example");
+    request = request.header("Origin", "example");
+    request = request.header("Upgrade", "websocket");
+    request = request.header("Connection", "Upgrade");
 
     for (key, value) in config.get_websocket_headers() {
         request = request.header(key, value);
