@@ -125,7 +125,7 @@ pub async fn connect(
     }
 
     // Remove the Sec-WebSocket-Key header if it exists
-    request.headers_mut().map(|h| h.remove("Sec-WebSocket-Key"));
+    request.headers_mut().map(|h| h.remove("sec-websocket-key"));
 
     let sock = match url.scheme() {
         "ws" => MaybeTlsStream::Plain(
