@@ -114,28 +114,16 @@ pub async fn connect(
         .join(",");
     request = request.header("Sec-WebSocket-Protocol", serializer_list);
 
+    let key = tokio_tungstenite::tungstenite::handshake::client::generate_key();
+    request = request.header("Sec-WebSocket-Key", key.clone());
     request = request.header("Sec-WebSocket-Version", 13);
-    request = request.header("Host", "example");
-    request = request.header("Origin", "example");
+    request = request.header("Host", url.host().unwrap().to_string());
+    request = request.header("Origin", url.origin().unicode_serialization());
     request = request.header("Upgrade", "websocket");
     request = request.header("Connection", "Upgrade");
 
     for (key, value) in config.get_websocket_headers() {
         request = request.header(key, value);
-
-        error!("Custom Header '{}' = '{:?}'", key, value);
-    }
-
-    // Remove the Sec-WebSocket-Key header if it exists
-    request.headers_mut().map(|h| h.remove("sec-websocket-key"));
-
-    error!(
-        "Number of headers: {}",
-        request.headers_ref().map(|h| h.len()).unwrap_or(0)
-    );
-
-    for (key, value) in request.headers_ref().unwrap().iter() {
-        error!("Request Header '{}' = '{:?}'", key.as_str(), value);
     }
 
     let sock = match url.scheme() {
@@ -158,10 +146,6 @@ pub async fn connect(
     };
 
     let request_body = request.body(()).unwrap();
-
-    for (key, value) in request_body.headers().iter() {
-        error!("Request Header '{}' = '{:?}'", key.as_str(), value);
-    }
 
     let (client, resp) = match client_async(request_body, sock).await {
         Ok(v) => v,
