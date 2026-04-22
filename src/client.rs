@@ -2,6 +2,7 @@ use std::{
     collections::{HashMap, HashSet},
     future::Future,
     sync::Arc,
+    time::Duration,
 };
 
 use futures::FutureExt;
@@ -14,7 +15,73 @@ use tokio::sync::{
 use url::*;
 
 pub use crate::common::*;
-use crate::{core::*, error::*, options::*, serializer::SerializerType};
+use crate::{
+    core::{Core, Request, SubscriptionQueue, Supervisor},
+    error::*,
+    options::*,
+    serializer::SerializerType,
+};
+
+/// Exponential-backoff reconnect policy for the WAMP client.
+///
+/// When set on [`ClientConfig`], a supervisor wraps the event loop and, on
+/// transport-level receive failures (connection resets, idle-timeout kills,
+/// etc.), attempts to re-establish the underlying connection before giving
+/// up. Realm join, subscriptions, and RPC registrations are *not* replayed
+/// automatically — subscribe to the reconnect-event channel (see
+/// [`Client::take_reconnect_events`]) to re-establish them when a reconnect
+/// succeeds.
+#[derive(Debug, Clone)]
+pub struct ReconnectPolicy {
+    /// Maximum number of reconnect attempts. `None` means retry forever.
+    pub max_retries: Option<u32>,
+    /// Delay before the first reconnect attempt.
+    pub initial_backoff: Duration,
+    /// Upper bound on the per-attempt delay.
+    pub max_backoff: Duration,
+    /// Multiplier applied to the backoff after each failed attempt.
+    pub backoff_multiplier: f64,
+}
+
+impl ReconnectPolicy {
+    /// A sensible default: infinite retries, 500 ms → 30 s exponential backoff.
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+
+impl Default for ReconnectPolicy {
+    fn default() -> Self {
+        ReconnectPolicy {
+            max_retries: None,
+            initial_backoff: Duration::from_millis(500),
+            max_backoff: Duration::from_secs(30),
+            backoff_multiplier: 2.0,
+        }
+    }
+}
+
+/// Events emitted by the supervisor while it reconnects the transport.
+///
+/// `cause` fields are pre-formatted strings rather than `WampError` so the
+/// event is cheaply cloneable across multiple reconnect attempts and can be
+/// forwarded through non-`Clone` error boundaries.
+#[derive(Debug, Clone)]
+pub enum ReconnectEvent {
+    /// Transport-level receive failure detected. The supervisor is about to
+    /// sleep `delay` and then try attempt number `attempt` (1-indexed).
+    Reconnecting {
+        attempt: u32,
+        cause: String,
+        delay: Duration,
+    },
+    /// Transport has been re-established. The caller should re-join the realm
+    /// (and re-subscribe / re-register if applicable) before issuing further
+    /// WAMP requests.
+    Reconnected,
+    /// Reconnect was given up on because `max_retries` was exceeded.
+    GaveUp { attempts: u32, cause: String },
+}
 
 /// Options one can set when connecting to a WAMP server
 pub struct ClientConfig {
@@ -32,6 +99,12 @@ pub struct ClientConfig {
     ssl_verify: bool,
     /// Additional WebSocket headers on establish connection
     websocket_headers: HashMap<String, String>,
+    /// If set, the websocket transport will send a Ping frame every
+    /// `keepalive_interval` of inactivity to prevent idle-timeout resets.
+    keepalive_interval: Option<Duration>,
+    /// If set, the supervisor will transparently reconnect on transport-level
+    /// receive failures instead of tearing down the client.
+    reconnect_policy: Option<ReconnectPolicy>,
 }
 
 impl Default for ClientConfig {
@@ -68,6 +141,8 @@ impl Default for ClientConfig {
             ssl_verify: true,
             websocket_headers: HashMap::new(),
             authextra: HashMap::new(),
+            keepalive_interval: None,
+            reconnect_policy: None,
         }
     }
 }
@@ -82,6 +157,8 @@ impl Clone for ClientConfig {
             max_msg_size: self.max_msg_size,
             ssl_verify: self.ssl_verify,
             websocket_headers: self.websocket_headers.clone(),
+            keepalive_interval: self.keepalive_interval,
+            reconnect_policy: self.reconnect_policy.clone(),
         }
     }
 }
@@ -152,6 +229,33 @@ impl ClientConfig {
     pub fn get_websocket_headers(&self) -> &HashMap<String, String> {
         &self.websocket_headers
     }
+
+    /// Enables WebSocket-level Ping keepalive at the given cadence.
+    ///
+    /// When a router silently drops idle connections (load balancer timeouts,
+    /// NAT rebinding, etc.), the reset only surfaces the next time the client
+    /// reads. A periodic Ping keeps the peer aware and typically short-circuits
+    /// idle reaping. Pass `None` to disable (the default).
+    pub fn set_keepalive_interval(mut self, interval: Option<Duration>) -> Self {
+        self.keepalive_interval = interval;
+        self
+    }
+    pub fn get_keepalive_interval(&self) -> Option<Duration> {
+        self.keepalive_interval
+    }
+
+    /// Enables automatic transport reconnect on receive failures.
+    ///
+    /// Realm join state, subscriptions, and RPC registrations are not replayed
+    /// automatically; consume [`Client::take_reconnect_events`] to re-establish
+    /// them when a `Reconnected` event fires.
+    pub fn set_reconnect_policy(mut self, policy: Option<ReconnectPolicy>) -> Self {
+        self.reconnect_policy = policy;
+        self
+    }
+    pub fn get_reconnect_policy(&self) -> Option<&ReconnectPolicy> {
+        self.reconnect_policy.as_ref()
+    }
 }
 
 /// Allows interaction as a client with a WAMP server
@@ -167,6 +271,10 @@ pub struct Client<'a> {
     session_id: Option<WampId>,
     /// Channel to send requests to the event loop
     ctl_channel: UnboundedSender<Request<'a>>,
+    /// Receiver for supervisor-emitted reconnect notifications. `None` when
+    /// reconnect is disabled, or after [`Client::take_reconnect_events`] has
+    /// handed the receiver out.
+    reconnect_events: Arc<Mutex<Option<UnboundedReceiver<ReconnectEvent>>>>,
 }
 
 /// All the states a client can be in
@@ -231,18 +339,44 @@ impl<'a> Client<'a> {
 
         let (ctl_channel, ctl_receiver) = mpsc::unbounded_channel();
         let (core_res_w, core_res) = mpsc::unbounded_channel();
+        let (rpc_event_queue_w, rpc_event_queue_r) = mpsc::unbounded_channel();
+
+        // Reconnect-event channel is only created when a policy is set, to
+        // avoid silently buffering events no one will ever read.
+        let (reconnect_events_tx, reconnect_events_rx) = if config.reconnect_policy.is_some() {
+            let (tx, rx) = mpsc::unbounded_channel();
+            (Some(tx), Some(rx))
+        } else {
+            (None, None)
+        };
 
         let ctl_sender = ctl_channel.clone();
-        // Establish a connection
-        let mut conn = Core::connect(&uri, &config, (ctl_sender, ctl_receiver), core_res_w).await?;
+        // Establish the initial connection; fail fast if this attempt fails.
+        // Subsequent drops are handled by the supervisor per the reconnect
+        // policy (if any).
+        let core = Core::connect(
+            &uri,
+            &config,
+            ctl_sender.clone(),
+            rpc_event_queue_w.clone(),
+        )
+        .await?;
 
         let rpc_evt_queue = if config.roles.contains(&ClientRole::Callee) {
-            conn.rpc_event_queue_r.take()
+            Some(rpc_event_queue_r)
         } else {
             None
         };
 
-        //let clone_res = Arc::new(core_res);
+        let supervisor = Supervisor::new(
+            uri,
+            config.clone(),
+            ctl_sender,
+            ctl_receiver,
+            core_res_w,
+            reconnect_events_tx,
+            rpc_event_queue_w,
+        );
 
         Ok((
             Client {
@@ -252,9 +386,21 @@ impl<'a> Client<'a> {
                 ctl_channel,
                 core_res: Arc::new(Mutex::new(core_res)),
                 core_status: ClientState::NoEventLoop,
+                reconnect_events: Arc::new(Mutex::new(reconnect_events_rx)),
             },
-            (Box::pin(conn.event_loop()), rpc_evt_queue),
+            (Box::pin(supervisor.run(core)), rpc_evt_queue),
         ))
+    }
+
+    /// Returns the receiver for supervisor-emitted reconnect notifications.
+    ///
+    /// Only one consumer can take the receiver; subsequent calls return
+    /// `None`. The receiver yields [`ReconnectEvent::Reconnecting`],
+    /// [`ReconnectEvent::Reconnected`], and [`ReconnectEvent::GaveUp`] as the
+    /// supervisor progresses. Returns `None` immediately when no
+    /// [`ReconnectPolicy`] is configured.
+    pub async fn take_reconnect_events(&self) -> Option<UnboundedReceiver<ReconnectEvent>> {
+        self.reconnect_events.lock().await.take()
     }
 
     /// Attempts to join a realm and start a session with the server.
@@ -878,6 +1024,7 @@ impl<'a> Clone for Client<'a> {
             core_status: self.core_status.clone(),
             session_id: self.session_id,
             ctl_channel: self.ctl_channel.clone(),
+            reconnect_events: Arc::clone(&self.reconnect_events),
         }
     }
 }

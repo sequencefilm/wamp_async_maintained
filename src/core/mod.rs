@@ -14,8 +14,10 @@ use crate::{common::*, error::*, serializer::*, transport::*};
 
 mod recv;
 mod send;
+mod supervisor;
 
 pub use send::Request;
+pub use supervisor::Supervisor;
 
 use crate::{Arg, client, message::*};
 
@@ -23,6 +25,19 @@ pub enum Status {
     /// Returned when the event loop should shutdown
     Shutdown,
     Ok,
+}
+
+/// Reason the event loop returned. The supervisor inspects this to decide
+/// whether to attempt a reconnect or tear down.
+pub enum EventLoopExit {
+    /// Graceful shutdown (Request::Shutdown, peer GOODBYE, or leaving the
+    /// realm). No reconnect should be attempted.
+    Shutdown,
+    /// The Client handle went away (ctl channel sender was dropped) before
+    /// sending Shutdown. Treated as terminal.
+    ClientDied,
+    /// Transport-level failure. Eligible for reconnect if a policy is set.
+    ConnectionLost(WampError),
 }
 
 pub type JoinResult = Sender<
@@ -72,13 +87,11 @@ pub struct Core<'a> {
     /// Generic transport
     sock: Box<dyn Transport + Send>,
     valid_session: bool,
-    core_res: UnboundedSender<Result<(), WampError>>,
     /// Generic serializer
     serializer: Box<dyn SerializerImpl + Send>,
-    /// Holds the request_id queues waiting for messages
+    /// Sender onto the control channel; cloned into RPC runner futures so
+    /// they can push InvocationResult replies back to the event loop.
     ctl_sender: UnboundedSender<Request<'a>>,
-    /// Channel for receiving client requests
-    ctl_channel: Option<UnboundedReceiver<Request<'a>>>, //Wrapped in option so we can give ownership to eventloop
 
     /// Holds set of pending requests
     pending_requests: HashSet<WampId>,
@@ -94,20 +107,25 @@ pub struct Core<'a> {
     pending_register: HashMap<WampId, (RpcFunc<'a>, PendingRegisterResult)>,
     /// Currently registered RPC endpoints
     rpc_endpoints: HashMap<WampId, RpcFunc<'a>>,
-    /// Queue passed back to the client caller to handle rpc events
-    pub rpc_event_queue_r: Option<UnboundedReceiver<GenericFuture<'a>>>,
+    /// Supervisor-owned writer for RPC invocation futures. Kept across
+    /// reconnects so the Client's receiver stays valid.
     rpc_event_queue_w: UnboundedSender<GenericFuture<'a>>,
 
     pending_call: HashMap<WampId, PendingCallResult>,
 }
 
 impl<'a> Core<'a> {
-    /// Establishes a connection with a WAMP server
+    /// Establishes a connection with a WAMP server.
+    ///
+    /// The `ctl_sender` is cloned into RPC invocation futures so they can push
+    /// `InvocationResult` onto the event loop's control channel.
+    /// `rpc_event_queue_w` is owned by the supervisor and persists across
+    /// reconnects, keeping the Client's receiver valid.
     pub async fn connect(
         uri: &url::Url,
         cfg: &client::ClientConfig,
-        ctl_channel: (UnboundedSender<Request<'a>>, UnboundedReceiver<Request<'a>>),
-        core_res: UnboundedSender<Result<(), WampError>>,
+        ctl_sender: UnboundedSender<Request<'a>>,
+        rpc_event_queue_w: UnboundedSender<GenericFuture<'a>>,
     ) -> Result<Core<'a>, WampError> {
         // Connect to the router using the requested transport
         let (sock, serializer_type) = match uri.scheme() {
@@ -140,16 +158,11 @@ impl<'a> Core<'a> {
             SerializerType::MsgPack => Box::new(msgpack::MsgPackSerializer {}),
         };
 
-        //let (rpc_result_w, rpc_result_r) = mpsc::unbounded_channel();
-        let (rpc_event_queue_w, rpc_event_queue_r) = mpsc::unbounded_channel();
-
         Ok(Core {
             sock,
-            core_res,
             valid_session: false,
             serializer,
-            ctl_sender: ctl_channel.0,
-            ctl_channel: Some(ctl_channel.1),
+            ctl_sender,
             pending_requests: HashSet::new(),
             pending_transactions: HashMap::new(),
 
@@ -158,20 +171,22 @@ impl<'a> Core<'a> {
 
             pending_register: HashMap::new(),
             rpc_endpoints: HashMap::new(),
-            rpc_event_queue_r: Some(rpc_event_queue_r),
             rpc_event_queue_w,
             pending_call: HashMap::new(),
         })
     }
 
-    /// Event loop that handles outbound/inboud events
-    pub async fn event_loop(mut self) -> Result<(), WampError> {
-        let mut ctl_channel = self.ctl_channel.take().unwrap();
-
-        // Notify the client that we are now running the event loop
-        let _ = self.core_res.send(Ok(()));
-        loop {
-            match select! {
+    /// Drives the event loop against the supervisor-owned control channel.
+    ///
+    /// Returns an [`EventLoopExit`] describing why the loop stopped so the
+    /// supervisor can decide between reconnect, terminate, or propagate an
+    /// error. The transport is closed before returning.
+    pub async fn event_loop(
+        mut self,
+        ctl_channel: &mut UnboundedReceiver<Request<'a>>,
+    ) -> EventLoopExit {
+        let exit: EventLoopExit = loop {
+            let status = select! {
                 // Peer sent us a message
                 msg = self.recv() => {
                     match msg {
@@ -181,11 +196,10 @@ impl<'a> Core<'a> {
                             GOODBYE message (leaving the realm). If we have left the realm,
                             treat a recv() error as expected */
                             if self.valid_session {
-                                error!("Failed to recv : {:?}", e);
-                                let _ = self.core_res.send(Err(e));
+                                warn!("Failed to recv : {:?}", e);
+                                break EventLoopExit::ConnectionLost(e);
                             }
-
-                            break;
+                            break EventLoopExit::Shutdown;
                         },
                         Ok(m) => self.handle_peer_msg(m).await,
                     }
@@ -195,25 +209,21 @@ impl<'a> Core<'a> {
                     let req = match req {
                         Some(r) => r,
                         None => {
-                            let _ = self.core_res.send(Err(WampError::ClientDied));
-                            break;
+                            break EventLoopExit::ClientDied;
                         }
                     };
                     self.handle_local_request(req).await
                 }
-            } {
-                Status::Shutdown => {
-                    let _ = self.core_res.send(Ok(()));
-                    break;
-                }
+            };
+            match status {
+                Status::Shutdown => break EventLoopExit::Shutdown,
                 Status::Ok => {}
             }
-        }
-        debug!("Event loop shutting down !");
+        };
 
+        debug!("Event loop returning : shutting down transport");
         self.shutdown().await;
-
-        Ok(())
+        exit
     }
 
     /// Handles unsolicited messages from the peer (events, rpc calls, etc...)

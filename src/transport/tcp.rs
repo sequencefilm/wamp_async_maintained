@@ -237,7 +237,7 @@ impl SockWrapper {
 
         if let Err(e) = res {
             debug!("Failed to recv on RawSocket : {:?}", e);
-            return Err(TransportError::ReceiveFailed);
+            return Err(TransportError::ReceiveFailed(format!("{:?}", e)));
         }
 
         Ok(())
@@ -289,7 +289,9 @@ impl Transport for TcpTransport {
                 Some(m) => m,
                 None => {
                     error!("RawSocket message had an invalid header");
-                    return Err(TransportError::ReceiveFailed);
+                    return Err(TransportError::ReceiveFailed(
+                        "invalid RawSocket header".to_string(),
+                    ));
                 }
             };
 

@@ -1,9 +1,9 @@
-use std::str::FromStr;
+use std::{str::FromStr, time::Duration};
 
 use async_trait::async_trait;
 use futures::{SinkExt, StreamExt};
 use log::*;
-use tokio::net::TcpStream;
+use tokio::{net::TcpStream, time::Interval};
 use tokio_tungstenite::{
     MaybeTlsStream, WebSocketStream, client_async,
     tungstenite::{Bytes, Message, handshake::client::Request},
@@ -18,6 +18,22 @@ use crate::{
 struct WsCtx {
     is_bin: bool,
     client: WebSocketStream<MaybeTlsStream<TcpStream>>,
+    /// If set, send a Ping frame each time this interval fires while waiting
+    /// on `recv`. Kept as `Interval` so the next tick is correctly scheduled
+    /// relative to prior activity (tokio resets the deadline to "now" on each
+    /// tick).
+    keepalive: Option<Interval>,
+}
+
+fn new_keepalive(period: Option<Duration>) -> Option<Interval> {
+    period.map(|p| {
+        let mut interval = tokio::time::interval(p);
+        // Don't fire a retroactive ping the instant we start recv(); wait for
+        // the first real idle period. Skip also means a burst of slow
+        // recv()'s can't stack up pings.
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        interval
+    })
 }
 
 #[async_trait]
@@ -46,13 +62,42 @@ impl Transport for WsCtx {
         let payload: Vec<u8>;
         // Receive a message
         loop {
-            let msg: Message = match self.client.next().await {
+            // Split the borrow so `client` and `keepalive` can both be used
+            // inside tokio::select! below.
+            let Self {
+                client, keepalive, ..
+            } = self;
+
+            let next_msg = match keepalive {
+                Some(interval) => tokio::select! {
+                    biased;
+                    m = client.next() => m,
+                    _ = interval.tick() => {
+                        trace!("Sending websocket keepalive Ping");
+                        if let Err(e) = client.send(Message::Ping(Bytes::new())).await {
+                            warn!("Failed to send keepalive Ping : {:?}", e);
+                            return Err(TransportError::ReceiveFailed(format!(
+                                "keepalive ping failed: {:?}",
+                                e
+                            )));
+                        }
+                        continue;
+                    }
+                },
+                None => client.next().await,
+            };
+
+            let msg: Message = match next_msg {
                 Some(Ok(m)) => m,
                 Some(Err(e)) => {
-                    error!("Failed to recv from websocket : {:?}", e);
-                    return Err(TransportError::ReceiveFailed);
+                    warn!("Failed to recv from websocket : {:?}", e);
+                    return Err(TransportError::ReceiveFailed(format!("{:?}", e)));
                 }
-                None => return Err(TransportError::ReceiveFailed),
+                None => {
+                    return Err(TransportError::ReceiveFailed(
+                        "websocket stream closed".to_string(),
+                    ));
+                }
             };
 
             trace!("Recv[] : {:?}", msg);
@@ -78,6 +123,16 @@ impl Transport for WsCtx {
                         return Err(TransportError::UnexpectedResponse);
                     }
                     continue;
+                }
+                Message::Pong(_) => {
+                    trace!("Received websocket Pong");
+                    continue;
+                }
+                Message::Close(frame) => {
+                    return Err(TransportError::ReceiveFailed(format!(
+                        "peer sent close frame: {:?}",
+                        frame
+                    )));
                 }
                 _ => {
                     error!("Unexpected websocket message type : {:?}", msg);
@@ -192,6 +247,7 @@ pub async fn connect(
                 SerializerType::MsgPack | SerializerType::Cbor
             ),
             client,
+            keepalive: new_keepalive(config.get_keepalive_interval()),
         }),
         picked_serializer,
     ))

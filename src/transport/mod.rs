@@ -37,8 +37,8 @@ quick_error! {
         SendFailed {
             display("Failed to send message to peer")
         }
-        ReceiveFailed {
-            display("Failed to receive message from peer")
+        ReceiveFailed(reason: String) {
+            display("Failed to receive message from peer: {}", reason)
         }
     }
 }

@@ -7,7 +7,7 @@ mod options;
 mod serializer;
 mod transport;
 
-pub use client::{Client, ClientConfig, ClientState};
+pub use client::{Client, ClientConfig, ClientState, ReconnectEvent, ReconnectPolicy};
 pub use common::*;
 pub use error::*;
 pub use options::*;
