@@ -23,6 +23,16 @@ struct WsCtx {
     /// relative to prior activity (tokio resets the deadline to "now" on each
     /// tick).
     keepalive: Option<Interval>,
+    /// Number of Ping frames we've sent without observing any incoming
+    /// activity in return. Reset to 0 on every received frame (Pong, Text,
+    /// Binary, Ping, Close — anything proves the path is alive). When this
+    /// hits [`Self::max_missed_pongs`] we treat the connection as dead even
+    /// if the underlying socket is still nominally open (half-open NAT, peer
+    /// black-hole, etc.).
+    missed_pongs: u32,
+    /// Threshold at which `missed_pongs` triggers a transport error. Only
+    /// meaningful when `keepalive` is `Some`. 0 disables the check.
+    max_missed_pongs: u32,
 }
 
 fn new_keepalive(period: Option<Duration>) -> Option<Interval> {
@@ -62,10 +72,14 @@ impl Transport for WsCtx {
         let payload: Vec<u8>;
         // Receive a message
         loop {
-            // Split the borrow so `client` and `keepalive` can both be used
-            // inside tokio::select! below.
+            // Split the borrow so `client`, `keepalive`, and the pong tracker
+            // can all be used inside tokio::select! below.
             let Self {
-                client, keepalive, ..
+                client,
+                keepalive,
+                missed_pongs,
+                max_missed_pongs,
+                ..
             } = self;
 
             let next_msg = match keepalive {
@@ -79,6 +93,21 @@ impl Transport for WsCtx {
                             return Err(TransportError::ReceiveFailed(format!(
                                 "keepalive ping failed: {:?}",
                                 e
+                            )));
+                        }
+                        // Count this ping as outstanding; only an incoming
+                        // frame will clear it. Half-open connections sit here
+                        // forever otherwise — buffered Pings drain into a
+                        // black hole and recv() never wakes.
+                        *missed_pongs = missed_pongs.saturating_add(1);
+                        if *max_missed_pongs > 0 && *missed_pongs >= *max_missed_pongs {
+                            warn!(
+                                "Websocket keepalive: {} Pings outstanding without reply, declaring connection dead",
+                                missed_pongs
+                            );
+                            return Err(TransportError::ReceiveFailed(format!(
+                                "no peer activity after {} keepalive Pings",
+                                missed_pongs
                             )));
                         }
                         continue;
@@ -99,6 +128,10 @@ impl Transport for WsCtx {
                     ));
                 }
             };
+
+            // Any incoming frame proves the peer is reachable — clear the
+            // outstanding-ping counter regardless of frame type.
+            self.missed_pongs = 0;
 
             trace!("Recv[] : {:?}", msg);
 
@@ -248,6 +281,8 @@ pub async fn connect(
             ),
             client,
             keepalive: new_keepalive(config.get_keepalive_interval()),
+            missed_pongs: 0,
+            max_missed_pongs: config.get_keepalive_max_missed_pongs(),
         }),
         picked_serializer,
     ))

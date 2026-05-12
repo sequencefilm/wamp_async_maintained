@@ -102,6 +102,12 @@ pub struct ClientConfig {
     /// If set, the websocket transport will send a Ping frame every
     /// `keepalive_interval` of inactivity to prevent idle-timeout resets.
     keepalive_interval: Option<Duration>,
+    /// Maximum number of consecutive keepalive Pings without any incoming
+    /// frame from the peer before the connection is declared dead. Set to 0
+    /// to disable the check (treat the connection as alive as long as the
+    /// socket is open). Defaults to 2, i.e. one "missed" pong is tolerated to
+    /// absorb transient latency but two in a row trip the failure.
+    keepalive_max_missed_pongs: u32,
     /// If set, the supervisor will transparently reconnect on transport-level
     /// receive failures instead of tearing down the client.
     reconnect_policy: Option<ReconnectPolicy>,
@@ -142,6 +148,7 @@ impl Default for ClientConfig {
             websocket_headers: HashMap::new(),
             authextra: HashMap::new(),
             keepalive_interval: None,
+            keepalive_max_missed_pongs: 2,
             reconnect_policy: None,
         }
     }
@@ -158,6 +165,7 @@ impl Clone for ClientConfig {
             ssl_verify: self.ssl_verify,
             websocket_headers: self.websocket_headers.clone(),
             keepalive_interval: self.keepalive_interval,
+            keepalive_max_missed_pongs: self.keepalive_max_missed_pongs,
             reconnect_policy: self.reconnect_policy.clone(),
         }
     }
@@ -242,6 +250,24 @@ impl ClientConfig {
     }
     pub fn get_keepalive_interval(&self) -> Option<Duration> {
         self.keepalive_interval
+    }
+
+    /// Controls how many consecutive keepalive Pings may go unanswered before
+    /// the transport declares the connection dead.
+    ///
+    /// Without this, a half-open connection (peer black-hole, NAT timeout
+    /// after the router went away) can leave the client wedged in `recv()`
+    /// indefinitely: pings drain into a TCP send buffer that never gets
+    /// acked, and no Pong or data wakes the future. Pass `0` to disable the
+    /// check; the default is `2`, which tolerates a single late Pong.
+    ///
+    /// Only meaningful when [`Self::set_keepalive_interval`] is also set.
+    pub fn set_keepalive_max_missed_pongs(mut self, max: u32) -> Self {
+        self.keepalive_max_missed_pongs = max;
+        self
+    }
+    pub fn get_keepalive_max_missed_pongs(&self) -> u32 {
+        self.keepalive_max_missed_pongs
     }
 
     /// Enables automatic transport reconnect on receive failures.
@@ -401,6 +427,28 @@ impl<'a> Client<'a> {
     /// [`ReconnectPolicy`] is configured.
     pub async fn take_reconnect_events(&self) -> Option<UnboundedReceiver<ReconnectEvent>> {
         self.reconnect_events.lock().await.take()
+    }
+
+    /// Clears stale realm-session state so the caller can re-join after a
+    /// transport reconnect.
+    ///
+    /// The supervisor rebuilds the transport on its own when a
+    /// [`ReconnectPolicy`] is configured, but the realm session itself is
+    /// per-connection and not replayed. This method drops the cached
+    /// `session_id` and server-roles set so the next [`Client::join_realm`]
+    /// (or [`Client::join_realm_with_authentication`]) call is allowed
+    /// through instead of returning "already joined to a realm".
+    ///
+    /// Recommended flow on receiving [`ReconnectEvent::Reconnected`]:
+    ///
+    /// ```ignore
+    /// client.reset_session().await;
+    /// client.join_realm("realm1").await?;
+    /// // re-subscribe / re-register here
+    /// ```
+    pub async fn reset_session(&mut self) {
+        self.session_id = None;
+        self.server_roles.clear();
     }
 
     /// Attempts to join a realm and start a session with the server.

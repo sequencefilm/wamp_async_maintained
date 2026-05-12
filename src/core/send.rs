@@ -5,6 +5,16 @@ use tokio::sync::oneshot::Sender;
 
 use crate::{common::*, core::*, message::*};
 
+/// Constructs the connection-lost sentinel used to mark transport failures
+/// without losing the original error's `Display` content. Send paths must
+/// surface a [`WampError`] both to the in-flight oneshot AND to
+/// [`Status::ConnectionLost`]; `WampError` is not `Clone`, so we stringify the
+/// cause into a fresh `WampError` for the supervisor while moving the original
+/// to the caller.
+fn connection_lost_from(cause: &WampError) -> WampError {
+    From::from(format!("transport failed: {}", cause))
+}
+
 pub type JoinRealmResult = Result<(WampId, HashMap<WampString, Arg>), WampError>;
 pub enum Request<'a> {
     Shutdown,
@@ -125,8 +135,9 @@ pub async fn join_realm(
         })
         .await
     {
+        let lost = connection_lost_from(&e);
         let _ = res.send(Err(e));
-        return Status::Shutdown;
+        return Status::ConnectionLost(lost);
     }
 
     // Make sure the server responded with the proper message
@@ -135,8 +146,9 @@ pub async fn join_realm(
         let resp = match core.recv().await {
             Ok(r) => r,
             Err(e) => {
+                let lost = connection_lost_from(&e);
                 let _ = res.send(Err(e));
-                return Status::Shutdown;
+                return Status::ConnectionLost(lost);
             }
         };
 
@@ -151,8 +163,9 @@ pub async fn join_realm(
                         Ok(AuthenticationChallengeResponse { signature, extra }) => {
                             if let Err(e) = core.send(&Msg::Authenticate { signature, extra }).await
                             {
+                                let lost = connection_lost_from(&e);
                                 let _ = res.send(Err(e));
-                                return Status::Shutdown;
+                                return Status::ConnectionLost(lost);
                             }
                         }
                         Err(e) => {
@@ -195,8 +208,9 @@ pub async fn leave_realm(core: &mut Core<'_>, res: Sender<Result<(), WampError>>
         })
         .await
     {
+        let lost = connection_lost_from(&e);
         let _ = res.send(Err(e));
-        return Status::Shutdown;
+        return Status::ConnectionLost(lost);
     }
 
     let _ = res.send(Ok(()));
@@ -211,7 +225,7 @@ pub async fn subscribe(
     res: PendingSubResult,
 ) -> Status {
     let request = core.create_request();
-    if let Err(_e) = core
+    if let Err(e) = core
         .send(&Msg::Subscribe {
             request,
             topic,
@@ -220,8 +234,9 @@ pub async fn subscribe(
         .await
     {
         core.pending_requests.remove(&request);
-        // let _ = res.send(Err(e));
-        return Status::Shutdown;
+        let lost = connection_lost_from(&e);
+        let _ = res.send(Err(e));
+        return Status::ConnectionLost(lost);
     }
     core.pending_sub.insert(request, res);
 
@@ -254,8 +269,9 @@ pub async fn unsubscribe(
         .await
     {
         core.pending_requests.remove(&request);
+        let lost = connection_lost_from(&e);
         let _ = res.send(Err(e));
-        return Status::Shutdown;
+        return Status::ConnectionLost(lost);
     }
 
     core.pending_transactions.insert(request, res);
@@ -284,8 +300,9 @@ pub async fn publish(
         .await
     {
         core.pending_requests.remove(&request);
+        let lost = connection_lost_from(&e);
         let _ = res.send(Err(e));
-        return Status::Shutdown;
+        return Status::ConnectionLost(lost);
     }
 
     core.pending_transactions.insert(request, res);
@@ -312,8 +329,9 @@ pub async fn register<'a>(
         .await
     {
         core.pending_requests.remove(&request);
+        let lost = connection_lost_from(&e);
         let _ = res.send(Err(e));
-        return Status::Shutdown;
+        return Status::ConnectionLost(lost);
     }
 
     core.pending_register.insert(request, (func_ptr, res));
@@ -346,8 +364,9 @@ pub async fn unregister(
         .await
     {
         core.pending_requests.remove(&request);
+        let lost = connection_lost_from(&e);
         let _ = res.send(Err(e));
-        return Status::Shutdown;
+        return Status::ConnectionLost(lost);
     }
 
     core.pending_transactions.insert(request, res);
@@ -393,8 +412,9 @@ pub async fn invoke_yield(
             }
         }
     };
-    if core.send(&msg).await.is_err() {
-        return Status::Shutdown;
+    if let Err(e) = core.send(&msg).await {
+        let lost = connection_lost_from(&e);
+        return Status::ConnectionLost(lost);
     }
 
     Status::Ok
@@ -421,8 +441,9 @@ pub async fn call(
         .await
     {
         core.pending_requests.remove(&request);
+        let lost = connection_lost_from(&e);
         let _ = res.send(Err(e));
-        return Status::Shutdown;
+        return Status::ConnectionLost(lost);
     }
 
     core.pending_call.insert(request, res);

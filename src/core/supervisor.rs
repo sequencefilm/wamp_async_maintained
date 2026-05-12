@@ -131,17 +131,23 @@ impl<'a> Supervisor<'a> {
                 return Err(cause);
             }
 
+            // Jitter the actual sleep around `delay` so a fleet of clients
+            // restarting against a recovering router doesn't synchronise into
+            // a thundering herd. The advertised `delay` in the event/log is
+            // still the un-jittered value — the jitter only shifts the actual
+            // sleep up to +/-20%.
+            let jittered = apply_jitter(delay);
             info!(
                 "Supervisor: reconnect attempt {} in {:?} (cause: {})",
-                attempt, delay, cause_str
+                attempt, jittered, cause_str
             );
             self.emit(ReconnectEvent::Reconnecting {
                 attempt,
                 cause: cause_str.clone(),
-                delay,
+                delay: jittered,
             });
 
-            tokio::time::sleep(delay).await;
+            tokio::time::sleep(jittered).await;
 
             match Core::connect(
                 &self.uri,
@@ -180,6 +186,18 @@ fn next_backoff(current: Duration, policy: &ReconnectPolicy) -> Duration {
     Duration::from_secs_f64(capped)
 }
 
+/// Returns `delay` shifted by up to +/-20%. Decouples reconnect storms across
+/// a fleet of clients hitting the same router after a restart.
+fn apply_jitter(delay: Duration) -> Duration {
+    let base = delay.as_secs_f64();
+    if base <= 0.0 {
+        return delay;
+    }
+    // `rand::random::<f64>()` returns [0.0, 1.0); map to [-0.2, 0.2).
+    let factor = 1.0 + (rand::random::<f64>() - 0.5) * 0.4;
+    Duration::from_secs_f64((base * factor).max(0.0))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -215,5 +233,25 @@ mod tests {
         let p = mk_policy(250, 5_000, 0.5);
         let d = next_backoff(Duration::from_millis(250), &p);
         assert_eq!(d, Duration::from_millis(250));
+    }
+
+    #[test]
+    fn jitter_stays_within_band() {
+        let base = Duration::from_secs(10);
+        for _ in 0..256 {
+            let j = apply_jitter(base);
+            let secs = j.as_secs_f64();
+            // +/-20% window, with a small epsilon for floating-point slop.
+            assert!(
+                (7.99..=12.01).contains(&secs),
+                "jittered delay {} out of band",
+                secs
+            );
+        }
+    }
+
+    #[test]
+    fn jitter_is_idempotent_on_zero() {
+        assert_eq!(apply_jitter(Duration::ZERO), Duration::ZERO);
     }
 }

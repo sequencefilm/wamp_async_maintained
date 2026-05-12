@@ -22,8 +22,14 @@ pub use supervisor::Supervisor;
 use crate::{Arg, client, message::*};
 
 pub enum Status {
-    /// Returned when the event loop should shutdown
+    /// Returned when the event loop should shutdown gracefully (peer GOODBYE,
+    /// peer ABORT, explicit `Request::Shutdown`).
     Shutdown,
+    /// Returned when a request handler detected a transport-level failure
+    /// (typically `send()` returning Err). The event loop must surface this as
+    /// [`EventLoopExit::ConnectionLost`] so the supervisor will reconnect
+    /// instead of treating the drop as a clean teardown.
+    ConnectionLost(WampError),
     Ok,
 }
 
@@ -217,6 +223,10 @@ impl<'a> Core<'a> {
             };
             match status {
                 Status::Shutdown => break EventLoopExit::Shutdown,
+                Status::ConnectionLost(e) => {
+                    warn!("Event loop: handler reported connection lost : {}", e);
+                    break EventLoopExit::ConnectionLost(e);
+                }
                 Status::Ok => {}
             }
         };
