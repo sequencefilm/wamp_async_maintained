@@ -1004,7 +1004,13 @@ impl<'a> Client<'a> {
         match new_status {
             Some(Some(state)) => self.set_next_status(state),
             None => &self.core_status,
-            Some(None) => panic!("The event loop died without sending a new status"),
+            Some(None) => {
+                // Status channel closed — event loop has exited (supervisor gave up,
+                // shutdown raced, or transport teardown). Surface as Disconnected
+                // instead of panicking; callers handle Disconnected gracefully.
+                warn!("wamp event loop status channel closed; marking client Disconnected");
+                self.set_next_status(Err(WampError::ClientDied))
+            }
         }
     }
 
@@ -1029,7 +1035,7 @@ impl<'a> Client<'a> {
                 self.core_status = ClientState::Disconnected(new_status);
             }
             ClientState::Disconnected(_) => {
-                panic!("Got new core status after already being disconnected");
+                // Already disconnected; ignore duplicate teardown signals.
             }
         }
 
@@ -1049,7 +1055,8 @@ impl<'a> Client<'a> {
             match self.core_res.lock().await.recv().await {
                 Some(v) => v,
                 None => {
-                    panic!("The event loop died without sending a new status");
+                    warn!("wamp event loop status channel closed; marking client Disconnected");
+                    Err(WampError::ClientDied)
                 }
             }
         };
