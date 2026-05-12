@@ -13,9 +13,11 @@ use tokio::{
 use crate::{common::*, error::*, serializer::*, transport::*};
 
 mod recv;
+mod replay;
 mod send;
 mod supervisor;
 
+pub use replay::{RealmJoinArgs, RegReplayEntry, SessionReplayState, SubReplayEntry};
 pub use send::Request;
 pub use supervisor::Supervisor;
 
@@ -44,6 +46,15 @@ pub enum EventLoopExit {
     ClientDied,
     /// Transport-level failure. Eligible for reconnect if a policy is set.
     ConnectionLost(WampError),
+}
+
+/// Result of running [`Core::event_loop`] to completion. Bundles the exit
+/// reason with the [`SessionReplayState`] so the supervisor can hand the
+/// cached realm/subscriptions/registrations to the next `Core` for replay
+/// when auto-replay is enabled.
+pub struct CoreExit<'a> {
+    pub exit: EventLoopExit,
+    pub replay_state: Option<SessionReplayState<'a>>,
 }
 
 pub type JoinResult = Sender<
@@ -89,6 +100,34 @@ pub type PendingCallResult = Sender<
 type SubscriptionChannel =
     UnboundedSender<(WampId, WampDict, Option<WampArgs>, Option<WampKwArgs>)>;
 
+/// Wraps a pending SUBSCRIBE request so the reply handler knows whether the
+/// caller is a user-facing `Client::subscribe` call (Initial) or a replay
+/// re-binding driven by the supervisor (Replay).
+pub(crate) enum PendingSubEntry {
+    Initial {
+        topic: WampString,
+        options: WampDict,
+        res: PendingSubResult,
+    },
+    /// Re-issued SUBSCRIBE during session replay. The senders are already
+    /// alive in [`SessionReplayState`]; the reply handler just needs to know
+    /// which `client_sub_id` this new server ID is replacing.
+    Replay { client_sub_id: WampId },
+}
+
+/// Same Initial/Replay split as [`PendingSubEntry`] for REGISTER. The
+/// `func_ptr` is the internal Arc-wrapped form so it can be cloned cheaply
+/// into both `rpc_endpoints` and `replay_state` from the recv handler.
+pub(crate) enum PendingRegisterEntry<'a> {
+    Initial {
+        uri: WampString,
+        options: WampDict,
+        func_ptr: SharedRpcFunc<'a>,
+        res: PendingRegisterResult,
+    },
+    Replay { client_reg_id: WampId },
+}
+
 pub struct Core<'a> {
     /// Generic transport
     sock: Box<dyn Transport + Send>,
@@ -105,19 +144,39 @@ pub struct Core<'a> {
     pending_transactions: HashMap<WampId, Sender<Result<Option<WampId>, WampError>>>,
 
     /// Pending subscription requests sent to the server
-    pending_sub: HashMap<WampId, PendingSubResult>,
-    /// Current subscriptions
+    pending_sub: HashMap<WampId, PendingSubEntry>,
+    /// Current subscriptions, keyed by the *server-assigned* sub ID for this
+    /// connection. Cleared and rebuilt on every reconnect; user-facing IDs
+    /// remain stable via [`Self::subscription_aliases`].
     subscriptions: HashMap<WampId, Vec<SubscriptionChannel>>,
+    /// `client_sub_id` (the server ID returned to the user on the *first*
+    /// SUBSCRIBE) → current connection's server sub ID. Populated on every
+    /// SUBSCRIBED. Used to translate user-facing IDs (e.g. on UNSUBSCRIBE)
+    /// to whatever the live server thinks the ID is now.
+    pub(crate) subscription_aliases: HashMap<WampId, WampId>,
 
     /// Pending RPC registration requests sent to the server
-    pending_register: HashMap<WampId, (RpcFunc<'a>, PendingRegisterResult)>,
-    /// Currently registered RPC endpoints
-    rpc_endpoints: HashMap<WampId, RpcFunc<'a>>,
+    pending_register: HashMap<WampId, PendingRegisterEntry<'a>>,
+    /// Currently registered RPC endpoints, keyed by the connection's
+    /// server-assigned registration ID. Held as `SharedRpcFunc` so the same
+    /// closure can also live in [`SessionReplayState`] for cross-reconnect
+    /// replay.
+    rpc_endpoints: HashMap<WampId, SharedRpcFunc<'a>>,
+    /// `client_reg_id` → current server registration ID. Same role as
+    /// [`Self::subscription_aliases`] but for RPC registrations.
+    pub(crate) registration_aliases: HashMap<WampId, WampId>,
     /// Supervisor-owned writer for RPC invocation futures. Kept across
     /// reconnects so the Client's receiver stays valid.
     rpc_event_queue_w: UnboundedSender<GenericFuture<'a>>,
 
     pending_call: HashMap<WampId, PendingCallResult>,
+
+    /// When `Some`, every successful realm join / SUBSCRIBE / REGISTER is
+    /// recorded here so the supervisor can replay it after a transparent
+    /// reconnect. `None` when [`ReconnectPolicy::auto_replay_session`] is
+    /// disabled. Owned by `Core` while the event loop runs and handed back
+    /// via [`CoreExit`] on exit.
+    pub(crate) replay_state: Option<SessionReplayState<'a>>,
 }
 
 impl<'a> Core<'a> {
@@ -127,11 +186,17 @@ impl<'a> Core<'a> {
     /// `InvocationResult` onto the event loop's control channel.
     /// `rpc_event_queue_w` is owned by the supervisor and persists across
     /// reconnects, keeping the Client's receiver valid.
+    ///
+    /// `replay_state` is `Some` when the supervisor is configured to
+    /// transparently replay realm join / subscriptions / registrations after
+    /// a reconnect. It is owned by the new `Core` and returned in
+    /// [`CoreExit`] when the event loop exits.
     pub async fn connect(
         uri: &url::Url,
         cfg: &client::ClientConfig,
         ctl_sender: UnboundedSender<Request<'a>>,
         rpc_event_queue_w: UnboundedSender<GenericFuture<'a>>,
+        replay_state: Option<SessionReplayState<'a>>,
     ) -> Result<Core<'a>, WampError> {
         // Connect to the router using the requested transport
         let (sock, serializer_type) = match uri.scheme() {
@@ -174,23 +239,27 @@ impl<'a> Core<'a> {
 
             pending_sub: HashMap::new(),
             subscriptions: HashMap::new(),
+            subscription_aliases: HashMap::new(),
 
             pending_register: HashMap::new(),
             rpc_endpoints: HashMap::new(),
+            registration_aliases: HashMap::new(),
             rpc_event_queue_w,
             pending_call: HashMap::new(),
+            replay_state,
         })
     }
 
     /// Drives the event loop against the supervisor-owned control channel.
     ///
-    /// Returns an [`EventLoopExit`] describing why the loop stopped so the
-    /// supervisor can decide between reconnect, terminate, or propagate an
-    /// error. The transport is closed before returning.
+    /// Returns a [`CoreExit`] carrying both the reason for the loop ending
+    /// and the [`SessionReplayState`] that the supervisor needs to replay
+    /// the realm/subscriptions/registrations on the next connection. The
+    /// transport is closed before returning.
     pub async fn event_loop(
         mut self,
         ctl_channel: &mut UnboundedReceiver<Request<'a>>,
-    ) -> EventLoopExit {
+    ) -> CoreExit<'a> {
         let exit: EventLoopExit = loop {
             let status = select! {
                 // Peer sent us a message
@@ -232,12 +301,20 @@ impl<'a> Core<'a> {
         };
 
         debug!("Event loop returning : shutting down transport");
+        let replay_state = self.replay_state.take();
         self.shutdown().await;
-        exit
+        CoreExit { exit, replay_state }
+    }
+
+    /// Removes and returns the cached session-replay state, leaving `None` in
+    /// its place. Used by the supervisor between reconnect attempts so the
+    /// cache can be re-installed into the next `Core::connect`.
+    pub fn take_replay_state(&mut self) -> Option<SessionReplayState<'a>> {
+        self.replay_state.take()
     }
 
     /// Handles unsolicited messages from the peer (events, rpc calls, etc...)
-    async fn handle_peer_msg<'b>(&'b mut self, msg: Msg) -> Status
+    pub(crate) async fn handle_peer_msg<'b>(&'b mut self, msg: Msg) -> Status
     where
         'a: 'b,
     {

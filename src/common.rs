@@ -1,6 +1,6 @@
 use std::{
     collections::HashMap, convert::TryInto, fmt, future::Future, hash::Hash, num::NonZeroU64,
-    pin::Pin, str::FromStr,
+    pin::Pin, str::FromStr, sync::Arc,
 };
 
 use log::*;
@@ -416,13 +416,30 @@ pub type RpcFuture<'a> = std::pin::Pin<
             + 'a,
     >,
 >;
-/// Generic function that can receive RPC calls
+/// Generic function that can receive RPC calls.
+///
+/// Public API stays as `Box<dyn Fn>` so consumers can construct one directly
+/// (e.g. the `rpc_callee_with_context` example pattern); the crate converts
+/// internally to `Arc<dyn Fn>` so the closure can be shared between the
+/// per-connection `Core::rpc_endpoints` map and the cross-reconnect
+/// [`SessionReplayState`](crate::core::SessionReplayState).
 pub type RpcFunc<'a> =
     Box<dyn Fn(Option<WampArgs>, Option<WampKwArgs>) -> RpcFuture<'a> + Send + Sync + 'a>;
 
+/// Internal, shareable wrapper around an [`RpcFunc`]. Used inside `Core` and
+/// `SessionReplayState` so a single user-supplied closure can be cloned
+/// across reconnects without re-allocating. Public API still hands in
+/// `Box<dyn Fn>` ([`RpcFunc`]); the crate converts at the boundary.
+pub(crate) type SharedRpcFunc<'a> =
+    Arc<dyn Fn(Option<WampArgs>, Option<WampKwArgs>) -> RpcFuture<'a> + Send + Sync + 'a>;
+
 /// Authentication Challenge function that should handle a CHALLENGE request during authentication flow.
 /// See more details in [`crate::Client::join_realm_with_authentication`]
-pub type AuthenticationChallengeHandler<'a> = Box<
+///
+/// Wrapped in `Arc` (rather than `Box`) so the same handler can be invoked
+/// again by the supervisor's session-replay path after a transparent
+/// reconnect. The closure must therefore be safe to call multiple times.
+pub type AuthenticationChallengeHandler<'a> = Arc<
     dyn Fn(
             AuthenticationMethod,
             WampDict,

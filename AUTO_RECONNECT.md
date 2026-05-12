@@ -3,6 +3,23 @@
 How `wamp_async` reconnects after a transport drop, and what the **consumer of
 this crate** still has to do to fully recover a working WAMP session.
 
+## Two modes
+
+The crate offers two recovery modes, chosen on `ReconnectPolicy`:
+
+* **Transport-only (`auto_replay_session: false`, default)** — supervisor
+  re-establishes the websocket; application is responsible for re-running
+  HELLO / SUBSCRIBE / REGISTER on every `Reconnected` event. Use when you
+  want explicit visibility into every reconnect (e.g. to reconcile caches,
+  re-fetch state, decide what to re-subscribe to).
+* **Full session replay (`auto_replay_session: true`)** — supervisor
+  additionally re-runs the realm join (with cached credentials) and
+  re-issues SUBSCRIBE for every cached topic + REGISTER for every cached
+  RPC endpoint, transparently. User-facing subscription/registration IDs
+  remain stable across the reconnect via internal aliases, so existing
+  `SubscriptionQueue` receivers and `unsubscribe` / `unregister` calls keep
+  working with no application bookkeeping.
+
 ## What the crate handles for you
 
 Configured via `ClientConfig`:
@@ -21,6 +38,9 @@ let cfg = ClientConfig::default()
         initial_backoff: Duration::from_millis(500),
         max_backoff:     Duration::from_secs(30),
         backoff_multiplier: 2.0,
+        // Opt-in to full session replay (realm + subs + regs). Defaults to
+        // `false` for backwards compatibility.
+        auto_replay_session: true,
     }));
 ```
 
@@ -45,7 +65,53 @@ With this configured, the supervisor will:
    * `Reconnected` once a fresh transport is up.
    * `GaveUp { attempts, cause }` if `max_retries` is exceeded.
 
-## What the consumer MUST do on `Reconnected`
+## Mode A — Full session replay (`auto_replay_session: true`)
+
+With this flag set, the supervisor itself runs HELLO / SUBSCRIBE / REGISTER
+against the new transport before emitting `Reconnected`. The consumer's job
+shrinks to:
+
+* Spawn the event-loop future as usual.
+* (Optional) Take `take_reconnect_events()` if you want to log
+  reconnect attempts or surface `GaveUp` as a fatal error. Even if you do
+  nothing with the events, recovery still happens.
+* Make sure your registered RPC closures are safe to call across multiple
+  connections (they're `Fn`, not `FnOnce`, so this is already the contract,
+  but if you cache per-connection state inside the closure you'll want to
+  invalidate it when a `Reconnected` event arrives).
+
+What the supervisor replays automatically:
+
+1. Realm join: the same realm name, roles, agent, auth method, auth id,
+   `authextra`, and challenge handler from the **first** successful
+   `join_realm[_with_authentication|_with_cryptosign]` call. The cached
+   `AuthenticationChallengeHandler` is `Arc`-wrapped and re-invoked on
+   every CHALLENGE, so the handler closure must be safe to call many
+   times.
+2. Every `client.subscribe(topic, …)` that succeeded, in the order it was
+   first registered, with the *same client-facing `sub_id`*. Outstanding
+   `SubscriptionQueue` receivers keep delivering events from the new
+   connection without the application touching them.
+3. Every `client.register(uri, …)` that succeeded, with the *same
+   client-facing `rpc_id`*. Subsequent RPC calls dispatch to the cached
+   closure on the new connection.
+
+What is **not** replayed automatically (even in this mode):
+
+* In-flight `call`/`publish(ack)`/`subscribe`/`register` requests that
+  were outstanding at the moment of the drop. They resolve with `"Core
+  never returned a response"`. Wrap user-visible RPCs in a retry layer if
+  you need at-least-once semantics.
+* `leave_realm` semantics: calling `leave_realm()` clears the cached
+  session, so the next disconnect-and-reconnect cycle will rebuild only
+  the transport, not the realm. (Equivalent to opting out of replay.)
+* Subscriptions / registrations the server *rejects* during replay (e.g.
+  permissions changed, topic policy changed). These are dropped from the
+  cache and the application will need to re-issue them explicitly — and
+  the replay attempt counts as a failed reconnect attempt and is retried
+  with backoff.
+
+## Mode B — Transport-only (`auto_replay_session: false`)
 
 The WAMP **realm session** is per-connection. The supervisor does **not**
 replay it. On `ReconnectEvent::Reconnected`, the consumer is responsible for:
@@ -75,7 +141,38 @@ replay it. On `ReconnectEvent::Reconnected`, the consumer is responsible for:
    when the oneshot is dropped on the dead `Core`. The consumer should
    treat that as "retry once we're reconnected" rather than "fatal."
 
-## Recommended consumer skeleton
+## Recommended consumer skeleton (Mode A — auto-replay)
+
+```rust
+use wamp_async::{Client, ClientConfig, ReconnectPolicy};
+
+let cfg = ClientConfig::default()
+    .set_keepalive_interval(Some(std::time::Duration::from_secs(20)))
+    .set_reconnect_policy(Some(ReconnectPolicy {
+        auto_replay_session: true,
+        ..Default::default()
+    }));
+
+let (mut client, (event_loop, rpc_queue)) =
+    Client::connect("wss://router.example/ws", Some(cfg)).await?;
+
+tokio::spawn(event_loop);
+if let Some(mut rpc_queue) = rpc_queue {
+    tokio::spawn(async move {
+        while let Some(fut) = rpc_queue.recv().await { tokio::spawn(fut); }
+    });
+}
+
+// First-time setup. After this point, transport drops are recovered
+// automatically — no recovery code needed.
+client.join_realm("realm1").await?;
+let (_sub_id, mut events) = client.subscribe("topic.example").await?;
+client.register("rpc.example", |args, kwargs| async move { Ok((args, kwargs)) }).await?;
+
+// `events` keeps producing across reconnects with the same _sub_id.
+```
+
+## Recommended consumer skeleton (Mode B — transport-only)
 
 ```rust
 use tokio::sync::mpsc::UnboundedReceiver;

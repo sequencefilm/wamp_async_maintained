@@ -1,7 +1,7 @@
 use crate::core::*;
 
 pub async fn subscribed(core: &mut Core<'_>, request: WampId, sub_id: WampId) -> Status {
-    let res = match core.pending_sub.remove(&request) {
+    let entry = match core.pending_sub.remove(&request) {
         Some(v) => v,
         None => {
             warn!(
@@ -11,17 +11,73 @@ pub async fn subscribed(core: &mut Core<'_>, request: WampId, sub_id: WampId) ->
             return Status::Ok;
         }
     };
-    let (evt_queue_w, evt_queue_r) = mpsc::unbounded_channel();
 
-    core.subscriptions.entry(sub_id).or_default();
+    match entry {
+        PendingSubEntry::Initial { topic, options, res } => {
+            let (evt_queue_w, evt_queue_r) = mpsc::unbounded_channel();
 
-    // Add the subscription ID to our subscription map
-    let mut subs = core.subscriptions.get(&sub_id).unwrap().to_owned();
-    subs.insert(0, evt_queue_w);
-    core.subscriptions.insert(sub_id, subs);
+            // Add the new sender to the current-connection subscriptions map.
+            core.subscriptions
+                .entry(sub_id)
+                .or_default()
+                .insert(0, evt_queue_w.clone());
 
-    // Send the event queue back to the requestor
-    let _ = res.send(Ok((sub_id, evt_queue_r)));
+            // The very first server-assigned ID becomes the stable
+            // client-facing ID. Subsequent reconnects update the alias to
+            // point at whatever the server gives us, but the user keeps
+            // calling unsubscribe(sub_id) with this original value.
+            let client_sub_id = sub_id;
+            core.subscription_aliases.insert(client_sub_id, sub_id);
+
+            // Record into replay state so we can re-subscribe after a
+            // reconnect. The sender Vec lives here (the per-connection
+            // subscriptions map holds a clone).
+            if let Some(rs) = core.replay_state.as_mut() {
+                rs.subscriptions
+                    .entry(client_sub_id)
+                    .or_insert_with(|| SubReplayEntry {
+                        topic,
+                        options,
+                        senders: Vec::new(),
+                    })
+                    .senders
+                    .push(evt_queue_w);
+            }
+
+            let _ = res.send(Ok((client_sub_id, evt_queue_r)));
+        }
+        PendingSubEntry::Replay { client_sub_id } => {
+            // The senders are already alive in replay_state — clone them
+            // into the per-connection subscriptions map under the new
+            // server-assigned ID, and update the alias so user-facing
+            // unsubscribe calls translate to the live server ID.
+            let senders = match core.replay_state.as_ref() {
+                Some(rs) => match rs.subscriptions.get(&client_sub_id) {
+                    Some(entry) => entry.senders.clone(),
+                    None => {
+                        warn!(
+                            "Replay SUBSCRIBED for missing client_sub_id {} ({})",
+                            client_sub_id, sub_id
+                        );
+                        return Status::Ok;
+                    }
+                },
+                None => {
+                    warn!("Replay SUBSCRIBED with no replay state — programmer error");
+                    return Status::Ok;
+                }
+            };
+            core.subscriptions
+                .entry(sub_id)
+                .or_default()
+                .extend(senders);
+            core.subscription_aliases.insert(client_sub_id, sub_id);
+            debug!(
+                "Replay: re-bound sub {} → server ID {}",
+                client_sub_id, sub_id
+            );
+        }
+    }
 
     Status::Ok
 }
@@ -98,28 +154,82 @@ pub async fn event(
     Status::Ok
 }
 pub async fn registered(core: &mut Core<'_>, request: WampId, rpc_id: WampId) -> Status {
-    let (rpc_func, res) = match core.pending_register.remove(&request) {
+    let entry = match core.pending_register.remove(&request) {
         Some(v) => v,
         None => {
             warn!(
-                "Server sent subscribed event for ID we never asked for : {}",
+                "Server sent registered event for ID we never asked for : {}",
                 request
             );
             return Status::Ok;
         }
     };
 
-    // Check for ID collision
-    if core.rpc_endpoints.contains_key(&rpc_id) {
-        warn!("Server sent registered ID we already had registered");
-        return Status::Ok;
+    match entry {
+        PendingRegisterEntry::Initial {
+            uri,
+            options,
+            func_ptr,
+            res,
+        } => {
+            if core.rpc_endpoints.contains_key(&rpc_id) {
+                warn!("Server sent registered ID we already had registered");
+                return Status::Ok;
+            }
+
+            let client_reg_id = rpc_id;
+
+            // The per-connection map gets a clone of the Arc so invocations
+            // dispatch via a single HashMap lookup; the canonical copy lives
+            // in replay_state so it survives reconnects.
+            core.rpc_endpoints.insert(rpc_id, func_ptr.clone());
+            core.registration_aliases.insert(client_reg_id, rpc_id);
+
+            if let Some(rs) = core.replay_state.as_mut() {
+                rs.registrations.insert(
+                    client_reg_id,
+                    RegReplayEntry {
+                        uri,
+                        options,
+                        func_ptr,
+                    },
+                );
+            }
+
+            let _ = res.send(Ok(client_reg_id));
+        }
+        PendingRegisterEntry::Replay { client_reg_id } => {
+            if core.rpc_endpoints.contains_key(&rpc_id) {
+                warn!(
+                    "Replay REGISTERED collided with existing rpc endpoint {}",
+                    rpc_id
+                );
+                return Status::Ok;
+            }
+            let func_ptr = match core.replay_state.as_ref() {
+                Some(rs) => match rs.registrations.get(&client_reg_id) {
+                    Some(entry) => entry.func_ptr.clone(),
+                    None => {
+                        warn!(
+                            "Replay REGISTERED for missing client_reg_id {} ({})",
+                            client_reg_id, rpc_id
+                        );
+                        return Status::Ok;
+                    }
+                },
+                None => {
+                    warn!("Replay REGISTERED with no replay state — programmer error");
+                    return Status::Ok;
+                }
+            };
+            core.rpc_endpoints.insert(rpc_id, func_ptr);
+            core.registration_aliases.insert(client_reg_id, rpc_id);
+            debug!(
+                "Replay: re-bound rpc {} → server ID {}",
+                client_reg_id, rpc_id
+            );
+        }
     }
-
-    // Add the registered ID to our registered rpc map
-    let _ = core.rpc_endpoints.insert(rpc_id, rpc_func);
-
-    // Send the rpc info back to the requestor
-    let _ = res.send(Ok(rpc_id));
 
     Status::Ok
 }
@@ -252,24 +362,50 @@ pub async fn error(
     let error = WampError::ServerError(error, details);
     match typ {
         SUBSCRIBE_ID => {
-            let res = match core.pending_sub.remove(&request) {
-                Some(r) => r,
+            match core.pending_sub.remove(&request) {
+                Some(PendingSubEntry::Initial { res, .. }) => {
+                    let _ = res.send(Err(error));
+                }
+                Some(PendingSubEntry::Replay { client_sub_id }) => {
+                    // The server refused a replay SUBSCRIBE (permissions
+                    // changed, topic gone, etc.). Drop the entry from
+                    // replay state so it doesn't keep failing forever; the
+                    // application will need to re-subscribe explicitly.
+                    warn!(
+                        "Replay SUBSCRIBE rejected for client_sub_id {} : {:?}",
+                        client_sub_id, error
+                    );
+                    if let Some(rs) = core.replay_state.as_mut() {
+                        rs.subscriptions.remove(&client_sub_id);
+                    }
+                    core.subscription_aliases.remove(&client_sub_id);
+                }
                 None => {
                     warn!("Received error for subscribe message we never sent");
                     return Status::Ok;
                 }
-            };
-            let _ = res.send(Err(error));
+            }
         }
         REGISTER_ID => {
-            let (_, res) = match core.pending_register.remove(&request) {
-                Some(r) => r,
+            match core.pending_register.remove(&request) {
+                Some(PendingRegisterEntry::Initial { res, .. }) => {
+                    let _ = res.send(Err(error));
+                }
+                Some(PendingRegisterEntry::Replay { client_reg_id }) => {
+                    warn!(
+                        "Replay REGISTER rejected for client_reg_id {} : {:?}",
+                        client_reg_id, error
+                    );
+                    if let Some(rs) = core.replay_state.as_mut() {
+                        rs.registrations.remove(&client_reg_id);
+                    }
+                    core.registration_aliases.remove(&client_reg_id);
+                }
                 None => {
                     warn!("Received error for RPC register message we never sent");
                     return Status::Ok;
                 }
-            };
-            let _ = res.send(Err(error));
+            }
         }
         CALL_ID => {
             let res = match core.pending_call.remove(&request) {

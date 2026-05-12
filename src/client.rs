@@ -41,6 +41,30 @@ pub struct ReconnectPolicy {
     pub max_backoff: Duration,
     /// Multiplier applied to the backoff after each failed attempt.
     pub backoff_multiplier: f64,
+    /// When `true`, after each successful transport reconnect the supervisor
+    /// transparently re-runs HELLO/CHALLENGE/WELCOME, then re-issues SUBSCRIBE
+    /// for every topic and REGISTER for every RPC endpoint that was active at
+    /// the moment of the drop. User-facing subscription/registration IDs
+    /// remain stable across the reconnect via internal aliases, so existing
+    /// `SubscriptionQueue` receivers and `unsubscribe`/`unregister` calls keep
+    /// working without any application-side bookkeeping.
+    ///
+    /// When `false` (the default) the supervisor only re-establishes the
+    /// transport; the application is responsible for calling
+    /// [`Client::reset_session`] and re-joining/re-subscribing/re-registering
+    /// in response to [`ReconnectEvent::Reconnected`].
+    ///
+    /// Trade-offs:
+    /// * On — application code is simpler. The price is that replay must be
+    ///   safe to repeat: the realm join captures credentials at first join
+    ///   and replays them verbatim, and RPC closures will be invoked across
+    ///   multiple connections.
+    /// * Off — the application sees every disconnect explicitly and can
+    ///   reconcile cached state, re-fetch via RPC, or skip re-subscribing to
+    ///   topics it no longer cares about.
+    ///
+    /// Defaults to `false` for backwards compatibility.
+    pub auto_replay_session: bool,
 }
 
 impl ReconnectPolicy {
@@ -57,6 +81,7 @@ impl Default for ReconnectPolicy {
             initial_backoff: Duration::from_millis(500),
             max_backoff: Duration::from_secs(30),
             backoff_multiplier: 2.0,
+            auto_replay_session: false,
         }
     }
 }
@@ -377,6 +402,15 @@ impl<'a> Client<'a> {
         };
 
         let ctl_sender = ctl_channel.clone();
+        // Allocate the replay-state cache up front if the policy opted into
+        // auto-replay; this is the single canonical instance threaded through
+        // every Core via Core::connect (taken in via Option, handed back via
+        // CoreExit on each event loop exit).
+        let initial_replay_state = config
+            .reconnect_policy
+            .as_ref()
+            .filter(|p| p.auto_replay_session)
+            .map(|_| crate::core::SessionReplayState::new());
         // Establish the initial connection; fail fast if this attempt fails.
         // Subsequent drops are handled by the supervisor per the reconnect
         // policy (if any).
@@ -385,6 +419,7 @@ impl<'a> Client<'a> {
             &config,
             ctl_sender.clone(),
             rpc_event_queue_w.clone(),
+            initial_replay_state,
         )
         .await?;
 
@@ -589,7 +624,7 @@ impl<'a> Client<'a> {
             realm.into(),
             authentication_methods,
             Some(authentication_id.into()),
-            Some(Box::new(move |authentication_method, extra| {
+            Some(Arc::new(move |authentication_method, extra| {
                 Box::pin(on_challenge_handler(authentication_method, extra))
             })),
         )
